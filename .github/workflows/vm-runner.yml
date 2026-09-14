@@ -1,0 +1,213 @@
+name: Universal VM Runner (QEMU + noVNC + Cloudflare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "URL installer ISO (x86_64/amd64 direkomendasikan untuk runner Intel; arm64 juga bisa)"
+        required: true
+        type: string
+      vm_memory:
+        description: "Memori VM (contoh: 2G, 8G; runner Intel punya 14 GB)"
+        required: false
+        default: "8G"
+        type: string
+      vm_cpus:
+        description: "CPU VM (maks 4 pada runner Intel)"
+        required: false
+        default: "4"
+        type: string
+      disk_size:
+        description: "Ukuran disk virtual (contoh: 10G, 20G; hati-hati kapasitas runner 14 GB)"
+        required: false
+        default: "20G"
+        type: string
+      keep_alive_minutes:
+        description: "Durasi runner tetap hidup (menit, maks 360)"
+        required: false
+        default: "360"
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Checkout repository (for scripts)
+        id: checkout
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # INSTALL QEMU + TOOLS
+      # ============================================================
+      - name: Install QEMU + cloudflared
+        id: install-tools
+        run: |
+          C_CYAN='\033[1;36m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_NC='\033[0m'
+
+          echo ""
+          echo "------------------------------------------------------------"
+          echo -e "${C_CYAN}[STEP 01/03] INSTALL QEMU + CLOUDFLARED${C_NC}"
+          echo "------------------------------------------------------------"
+
+          arch
+
+          echo -e "${C_YELLOW}[INFO] Menginstall QEMU via Homebrew...${C_NC}"
+          brew install qemu 2>&1 | tail -5
+
+          echo -e "${C_YELLOW}[INFO] Menginstall cloudflared via Homebrew...${C_NC}"
+          brew install cloudflared 2>&1 | tail -5
+          if ! command -v cloudflared >/dev/null 2>&1; then
+            echo -e "${C_YELLOW}[INFO] fallback: brew install cloudflare/cloudflare/cloudflared...${C_NC}"
+            brew install cloudflare/cloudflare/cloudflared 2>&1 | tail -5
+          fi
+
+          echo ""
+          echo -e "${C_GREEN}[OK] QEMU available:${C_NC}"
+          uname -m
+          command -v qemu-system-x86_64 && qemu-system-x86_64 --version 2>/dev/null | head -1 || true
+          command -v qemu-system-aarch64 && qemu-system-aarch64 --version 2>/dev/null | head -1 || true
+          echo -e "${C_GREEN}[OK] HVF support:${C_NC}"
+          sysctl -n kern.hv_support 2>/dev/null || echo "  (tidak tersedia — TCG saja)"
+          echo -e "${C_GREEN}[OK] cloudflared version:${C_NC}"
+          cloudflared --version 2>/dev/null | head -1 || true
+
+      # ============================================================
+      # RUN UNIVERSAL VM
+      # ============================================================
+      - name: Run Universal VM (QEMU + noVNC + Cloudflare Tunnel)
+        id: run-vm
+        timeout-minutes: 355
+        env:
+          ISO_URL: ${{ inputs.iso_url }}
+          VM_MEMORY: ${{ inputs.vm_memory }}
+          VM_CPUS: ${{ inputs.vm_cpus }}
+          DISK_SIZE: ${{ inputs.disk_size }}
+          KEEP_ALIVE_MINUTES: ${{ inputs.keep_alive_minutes }}
+        run: |
+          C_CYAN='\033[1;36m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_NC='\033[0m'
+
+          echo ""
+          echo "------------------------------------------------------------"
+          echo -e "${C_CYAN}[STEP 02/03] RUN UNIVERSAL VM (QEMU + noVNC + CLOUDFLARE)${C_NC}"
+          echo "------------------------------------------------------------"
+
+          if [ ! -f "$GITHUB_WORKSPACE/scripts/qemu/setup-vm.sh" ]; then
+            echo -e "${C_RED}[FAIL] scripts/qemu/setup-vm.sh tidak ditemukan (checkout gagal).${C_NC}"
+            exit 1
+          fi
+
+          chmod +x "$GITHUB_WORKSPACE/scripts/qemu/setup-vm.sh"
+          cd "$GITHUB_WORKSPACE"
+          "$GITHUB_WORKSPACE/scripts/qemu/setup-vm.sh"
+          echo -e "${C_GREEN}[OK] setup-vm.sh selesai.${C_NC}"
+
+      # ============================================================
+      # HOLD BREW PACKAGES
+      # ============================================================
+      - name: Hold Brew Packages
+        id: hold-brew
+        run: |
+          C_CYAN='\033[1;36m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_NC='\033[0m'
+
+          echo ""
+          echo "------------------------------------------------------------"
+          echo -e "${C_CYAN}[STEP 03/03] HOLD BREW PACKAGES${C_NC}"
+          echo "------------------------------------------------------------"
+
+          for p in cloudflared qemu; do
+            if brew list --versions "$p" >/dev/null 2>&1; then
+              brew pin "$p" 2>/dev/null || true
+              echo -e "${C_GREEN}[OK] brew pin: ${C_CYAN}$p${C_NC}"
+            fi
+          done
+
+          echo -e "${C_GREEN}[OK] Hold selesai.${C_NC}"
+
+      # ============================================================
+      # DIAGNOSTIC (only runs on failure)
+      # ============================================================
+      - name: Diagnostic (on failure)
+        id: diagnostic
+        if: failure()
+        run: |
+          C_CYAN='\033[1;36m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_NC='\033[0m'
+
+          echo ""
+          echo "=============================================================="
+          echo -e "${C_RED}  DIAGNOSTIC REPORT — FAILED STEP DETECTED${C_NC}"
+          echo "=============================================================="
+
+          echo ""
+          echo -e "${C_CYAN}[1/8] FAILED STEP (langkah: steps.*.conclusion)${C_NC}"
+          echo "  checkout:      ${{ steps.checkout.conclusion }}"
+          echo "  install-tools: ${{ steps.install-tools.conclusion }}"
+          echo "  run-vm:        ${{ steps.run-vm.conclusion }}"
+          echo "  hold-brew:     ${{ steps.hold-brew.conclusion }}"
+
+          echo ""
+          echo -e "${C_CYAN}[2/8] SYSTEM VERSION${C_NC}"
+          sw_vers 2>/dev/null || true
+          uname -a
+          arch
+
+          echo ""
+          echo -e "${C_CYAN}[3/8] DISK & MEMORY${C_NC}"
+          df -h / 2>/dev/null | head -3
+          sysctl hw.memsize 2>/dev/null || true
+          sysctl hw.ncpu 2>/dev/null || true
+
+          echo ""
+          echo -e "${C_CYAN}[4/8] QEMU / ISO / DISK${C_NC}"
+          uname -m
+          command -v qemu-system-x86_64 && qemu-system-x86_64 --version 2>/dev/null | head -2 || echo "  (qemu-system-x86_64 tidak terinstall)"
+          command -v qemu-system-aarch64 && qemu-system-aarch64 --version 2>/dev/null | head -2 || true
+          sysctl -n kern.hv_support 2>/dev/null || echo "  (HVF tidak tersedia)"
+          ls -lh "$GITHUB_WORKSPACE/installer.iso" 2>/dev/null || echo "  (installer.iso tidak ada)"
+          ls -lh "$GITHUB_WORKSPACE/disk.qcow2" 2>/dev/null || echo "  (disk.qcow2 tidak ada)"
+          du -h "$GITHUB_WORKSPACE/installer.iso" 2>/dev/null || true
+
+          echo ""
+          echo -e "${C_CYAN}[5/8] VNC / noVNC STATUS${C_NC}"
+          echo "  nc -z -G 2 127.0.0.1 5900 (QEMU VNC):"
+          if nc -z -G 2 127.0.0.1 5900 >/dev/null 2>&1; then
+            echo "    => BUKA"
+          else
+            echo "    => TUTUP"
+          fi
+          echo "  curl http://127.0.0.1:6080/vnc.html:"
+          if curl -sf "http://127.0.0.1:6080/vnc.html" >/dev/null 2>&1; then
+            echo "    => OK"
+          else
+            echo "    => GAGAL"
+          fi
+          echo "  noVNC log:"
+          tail -n 15 /tmp/novnc.log 2>/dev/null || echo "    (tidak ada)"
+          echo "  QEMU serial log (last 10):"
+          tail -n 10 "$GITHUB_WORKSPACE/vm-serial.log" 2>/dev/null || echo "    (tidak ada)"
+
+          echo ""
+          echo -e "${C_CYAN}[6/8] CLOUDFLARE TUNNEL${C_NC}"
+          echo "  novnc-url.txt:"
+          cat "$GITHUB_WORKSPACE/novnc-url.txt" 2>/dev/null || echo "    (tidak ada)"
+          echo "  cloudflared.log (last 15):"
+          tail -n 15 /tmp/cf-tunnel.log 2>/dev/null || echo "    (tidak ada)"
+
+          echo ""
+          echo -e "${C_CYAN}[7/8] RUNNING PROCESSES${C_NC}"
+          ps aux 2>/dev/null | grep -E 'qemu|novnc|cloudflared' | grep -v grep || echo "  (tidak ada)"
+
+          echo ""
+          echo -e "${C_CYAN}[8/8] JOB ENVIRONMENT${C_NC}"
+          echo "  ISO_URL = ${{ inputs.iso_url }}"
+          echo "  VM_MEMORY = ${{ inputs.vm_memory }}"
+          echo "  VM_CPUS = ${{ inputs.vm_cpus }}"
+          echo "  DISK_SIZE = ${{ inputs.disk_size }}"
+          echo "  KEEP_ALIVE = ${{ inputs.keep_alive_minutes }} min"
+
+          echo ""
+          echo "=============================================================="
+          echo -e "${C_RED}  DIAGNOSTIC COMPLETE — copy log ini untuk debugging.${C_NC}"
+          echo "=============================================================="
