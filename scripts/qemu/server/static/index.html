@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Universal VM Runner</title>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+</head>
+<body>
+
+  <!-- ============ LEFT INSTRUMENT RAIL ============ -->
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark">UV</div>
+      <div>
+        <div class="brand-name">Universal VM Runner</div>
+        <div class="brand-sub">QEMU &middot; QMP &middot; noVNC</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-label">Console</div>
+      <button class="nav-item active" data-view="console"><span class="icon">&#9635;</span> VM Display</button>
+      <button class="nav-item" data-view="terminal"><span class="icon">&#8252;</span> Serial Terminal</button>
+      <div class="nav-label">Manage</div>
+      <button class="nav-item" data-view="snapshots"><span class="icon">&#9202;</span> Snapshots</button>
+      <button class="nav-item" data-view="config"><span class="icon">&#9881;</span> Configuration</button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="beacon">
+        <span id="rail-beacon" class="beacon-dot off"></span>
+        <span id="rail-state">connecting&hellip;</span>
+      </div>
+      <div style="margin-top:6px" id="rail-time">--:--:--</div>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN WORKSPACE ============ -->
+  <main class="workspace">
+    <header class="topbar">
+      <div class="page-title" id="page-title">VM Display</div>
+      <div class="topbar-right">
+        <span id="top-cfg" class="mono">-</span>
+        <span id="qmp-badge" class="mono" style="color:var(--text-low)">qmp: &ndash;</span>
+        <span id="clock" class="mono">--:--:--</span>
+      </div>
+    </header>
+
+    <!-- ============ CONSOLE VIEW ============ -->
+    <section id="view-console" class="view active" style="display:none">
+      <div class="content" style="display:grid">
+
+        <!-- VM display -->
+        <div class="console-pane panel">
+          <div class="vm-toolbar" id="vm-toolbar">
+            <button class="tool-btn accent" data-action="reset" title="Send ACPI reset">&#8635; Reset</button>
+            <button class="tool-btn ok" data-action="resume" title="Resume execution">&#9654; Resume</button>
+            <button class="tool-btn" data-action="pause" title="Pause execution">&#10074;&#10074; Pause</button>
+            <button class="tool-btn danger" data-action="powerdown" title="ACPI power off">&#9249; Power off</button>
+            <span style="width:6px"></span>
+            <button class="tool-btn" data-action="key ctrl,alt,delete" title="Ctrl+Alt+Del">ctrl+alt+del</button>
+            <button class="tool-btn" data-action="key f2" title="Send F2">F2 setup</button>
+            <button class="tool-btn" data-action="key esc" title="Send Escape">esc</button>
+            <span style="width:6px"></span>
+            <button class="tool-btn" data-action="snapshot" title="Create a snapshot">&#9202; Snapshot</button>
+            <button class="tool-btn" data-action="screenshot" title="Capture screenshot">&#128247; Screenshot</button>
+          </div>
+          <div class="vm-screen" id="vm-screen">
+            <div class="vm-placeholder" id="vm-placeholder">
+              Loading console&hellip;<br>
+              <span style="color:var(--text-low);font-size:11px">connect via WebSocket to QEMU VNC</span>
+            </div>
+            <span class="vm-status-tag" id="vm-status-tag">&#8211;</span>
+          </div>
+        </div>
+
+        <!-- Instrument panel -->
+        <div class="instruments">
+          <div class="metric">
+            <span class="metric-label">power state</span>
+            <div class="big-state">
+              <span class="glow" id="state-glow"></span>
+              <span class="state-text" id="state-text">unknown</span>
+            </div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">uptime</span>
+            <div class="metric-value sm" id="uptime-val">--:--:--</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">cpu load</span>
+            <div class="metric-value" id="cpu-val">0<span class="unit">%</span></div>
+            <div class="meter"><div class="fill" id="cpu-fill"></div></div>
+            <canvas class="spark" id="cpu-spark"></canvas>
+          </div>
+          <div class="metric">
+            <span class="metric-label">memory</span>
+            <div class="metric-value" id="ram-val">--<span class="unit"></span></div>
+            <div class="meter"><div class="fill" id="ram-fill"></div></div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">disk written</span>
+            <div class="metric-value sm" id="disk-val">0<span class="unit"> MB</span></div>
+            <canvas class="spark" id="disk-spark"></canvas>
+          </div>
+          <div class="metric">
+            <span class="metric-label">installer phase</span>
+            <div class="meter" style="margin-top:4px"><div class="fill" id="inst-fill"></div></div>
+            <div class="metric-value sm" id="inst-val" style="margin-top:4px">waiting for VM</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">guest cpu &amp; vcpu</span>
+            <div class="metric-value sm" id="vcpu-val">&ndash;</div>
+          </div>
+        </div>
+
+        <!-- Serial console -->
+        <div class="serial-pane panel">
+          <div class="console-tabs">
+            <button class="tab active" data-mode="interact">interactive</button>
+            <button class="tab" data-mode="log">log</button>
+            <span class="grow" style="flex:1"></span>
+            <span style="color:var(--text-low);font-family:var(--mono);font-size:10px">QEMU serial console</span>
+          </div>
+          <div class="serial-body">
+            <div id="serial-terminal"></div>
+            <div class="serial-log-view" id="serial-log-view" style="display:none"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ============ SERIAL TERMINAL VIEW ============ -->
+    <section id="view-terminal" class="view" style="display:none">
+      <div class="grid-view" style="height:calc(100vh - var(--topbar-h));display:flex;flex-direction:column">
+        <div class="panel" style="flex:1;display:flex;flex-direction:column;min-height:0">
+          <div class="console-tabs">
+            <button class="tab active" data-mode="interact">interactive</button>
+            <button class="tab" data-mode="log">log</button>
+            <span class="grow" style="flex:1"></span>
+            <button class="tool-btn" id="term-clear" title="Clear terminal">clear</button>
+          </div>
+          <div class="serial-body" style="flex:1">
+            <div id="serial-terminal-full"></div>
+            <div class="serial-log-view" id="serial-log-view-full" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SNAPSHOTS VIEW ============ -->
+    <section id="view-snapshots" class="view" style="display:none">
+      <div class="grid-view">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+          <h2 class="page-sub" style="margin:0">VM Snapshots</h2>
+          <button class="tool-btn accent" id="snap-create">+ create snapshot</button>
+          <button class="tool-btn" id="snap-refresh">refresh</button>
+        </div>
+        <div class="panel">
+          <table class="snap-table">
+            <thead>
+              <tr><th>ID</th><th>Tag</th><th>VM size</th><th>Date</th><th></th></tr>
+            </thead>
+            <tbody id="snap-body">
+              <tr><td colspan="5" class="empty">No snapshots available &mdash; QMP must be connected</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ CONFIG VIEW ============ -->
+    <section id="view-config" class="view" style="display:none">
+      <div class="grid-view">
+        <h2 class="page-sub">Configuration</h2>
+        <div class="kv-grid" id="config-grid"></div>
+        <h2 class="page-sub" style="margin-top:24px">Installer monitor state</h2>
+        <div class="panel" id="installer-state-panel">
+          <pre id="installer-json" style="padding:14px;font-family:var(--mono);font-size:12px;color:var(--text-hi);white-space:pre-wrap"></pre>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toast-wrap"></div>
+
+  <!-- Vendor libs -->
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/xterm-addon-attach.js"></script>
+  <script src="/vendor/xterm/xterm-addon-fit.js"></script>
+
+  <!-- App -->
+  <script src="/static/js/ws.js"></script>
+  <script src="/static/js/ui.js"></script>
+  <script src="/static/js/metrics.js"></script>
+  <script src="/static/js/serial.js"></script>
+  <script src="/static/js/app.js"></script>
+
+</body>
+</html>

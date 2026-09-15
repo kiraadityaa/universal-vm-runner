@@ -1,4 +1,4 @@
-name: Universal VM Runner (QEMU + noVNC + Cloudflare)
+name: Universal VM Runner (QEMU + Web Dashboard + Cloudflare)
 
 on:
   workflow_dispatch:
@@ -77,7 +77,7 @@ jobs:
       # ============================================================
       # RUN UNIVERSAL VM
       # ============================================================
-      - name: Run Universal VM (QEMU + noVNC + Cloudflare Tunnel)
+      - name: Run Universal VM (Web Dashboard + QEMU + Cloudflare Tunnel)
         id: run-vm
         timeout-minutes: 355
         env:
@@ -91,7 +91,7 @@ jobs:
 
           echo ""
           echo "------------------------------------------------------------"
-          echo -e "${C_CYAN}[STEP 02/03] RUN UNIVERSAL VM (QEMU + noVNC + CLOUDFLARE)${C_NC}"
+          echo -e "${C_CYAN}[STEP 02/03] RUN UNIVERSAL VM (WEB DASHBOARD + QEMU + CLOUDFLARE)${C_NC}"
           echo "------------------------------------------------------------"
 
           if [ ! -f "$GITHUB_WORKSPACE/scripts/qemu/setup-vm.sh" ]; then
@@ -170,21 +170,37 @@ jobs:
           du -h "$GITHUB_WORKSPACE/installer.iso" 2>/dev/null || true
 
           echo ""
-          echo -e "${C_CYAN}[5/8] VNC / noVNC STATUS${C_NC}"
+          echo -e "${C_CYAN}[5/8] VNC / DASHBOARD / QMP STATUS${C_NC}"
           echo "  nc -z -G 2 127.0.0.1 5900 (QEMU VNC):"
           if nc -z -G 2 127.0.0.1 5900 >/dev/null 2>&1; then
             echo "    => BUKA"
           else
             echo "    => TUTUP"
           fi
-          echo "  curl http://127.0.0.1:6080/vnc.html:"
-          if curl -sf "http://127.0.0.1:6080/vnc.html" >/dev/null 2>&1; then
+          echo "  curl http://127.0.0.1:8080/ (dashboard):"
+          if curl -sf "http://127.0.0.1:8080/" >/dev/null 2>&1; then
             echo "    => OK"
           else
             echo "    => GAGAL"
           fi
+          echo "  curl http://127.0.0.1:8080/api/vm/status:"
+          curl -sf "http://127.0.0.1:8080/api/vm/status" 2>/dev/null && echo "  => OK" || echo "  => GAGAL"
+          echo "  QMP socket /tmp/qmp.sock:"
+          if [ -S /tmp/qmp.sock ]; then
+            echo "    => ADA"
+          else
+            echo "    => TIDAK ADA"
+          fi
+          echo "  Serial socket /tmp/serial.sock:"
+          if [ -S /tmp/serial.sock ]; then
+            echo "    => ADA"
+          else
+            echo "    => TIDAK ADA"
+          fi
           echo "  noVNC log:"
           tail -n 15 /tmp/novnc.log 2>/dev/null || echo "    (tidak ada)"
+          echo "  Dashboard log:"
+          tail -n 15 /tmp/dashboard.log 2>/dev/null || echo "    (tidak ada)"
           echo "  QEMU serial log (last 10):"
           tail -n 10 "$GITHUB_WORKSPACE/vm-serial.log" 2>/dev/null || echo "    (tidak ada)"
 

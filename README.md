@@ -1,8 +1,8 @@
 # Universal VM Runner
 
-> Boot **any Linux ISO** in a QEMU virtual machine running on a free GitHub Actions macOS runner — and watch it live in your browser via noVNC + Cloudflare Quick Tunnel. No account, no API key, no secrets.
+> Boot **any Linux ISO** in a QEMU virtual machine running on a free GitHub Actions macOS runner — and manage it from a full **web dashboard** in your browser via noVNC + Cloudflare Quick Tunnel. No account, no API key, no secrets.
 
-[![VM Runner](https://img.shields.io/badge/VM_Runner-QEMU+noVNC-blue?style=flat-square&logo=qemu&logoColor=white)](https://github.com/kiraadityaa/universal-vm-runner)
+[![VM Runner](https://img.shields.io/badge/VM_Runner-QEMU%20%2B%20Dashboard-blue?style=flat-square&logo=qemu&logoColor=white)](https://github.com/kiraadityaa/universal-vm-runner)
 [![Runner](https://img.shields.io/badge/Runner-macOS_Intel-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/actions/runner-images)
 [![Tunnel](https://img.shields.io/badge/Tunnel-Cloudflare-brightgreen?style=flat-square)](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
@@ -13,16 +13,16 @@
 
 ## What is this?
 
-Have you ever wanted to spin up a Linux distro in the cloud, fiddle with an installer, test a live ISO, or run a server workload — all from your browser, for free, without renting a VPS?
+Spin up a Linux distro in the cloud, interact with an installer, test a live ISO, or run a server workload — all from your browser, for free, without renting a VPS.
 
-**Universal VM Runner** runs the QEMU emulator on a **free GitHub-hosted macOS Intel runner** (4 vCPU / 14 GB RAM on public repos) and pipes the VM's display to you through:
+**Universal VM Runner** runs QEMU on a **free GitHub-hosted macOS Intel runner** (4 vCPU / 14 GB RAM on public repos) and exposes a **complete web management dashboard**:
 
-1. **QEMU** — emulates a full machine, boots the ISO you give it
-2. **VNС (port 5900)** — QEMU's built-in VNC server
-3. **noVNC** — HTML5 VNC client served on port 6080
-4. **Cloudflare Quick Tunnel** — free HTTPS tunnel, no account needed
-
-You provide one thing: a **direct link to an ISO**. The workflow returns a URL. Open it, and you're looking at a real VM booting.
+- 🖥️ **VM display** — embedded noVNC, resize-on-demand
+- ⌨️ **QMP control toolbar** — reset, power off, pause/resume, `Ctrl+Alt+Del`, F2, screenshot, snapshot
+- 🔌 **Interactive serial console** — xterm.js over WebSocket (works even when the GUI can't initialize)
+- 📊 **Live instruments** — power state, uptime, CPU load, RAM, disk I/O, vCPU count
+- 🧭 **Smart installer monitor** — detects `booting → installing → ready / failed` from serial output
+- ⏱️ **Snapshots** — create / list VM checkpoints via QMP
 
 ## How it works
 
@@ -33,18 +33,22 @@ You click "Run workflow" → paste ISO URL
 macOS runner (macos-15-intel: 4 vCPU / 14 GB RAM)
         │
         ├─ Download ISO
-        ├─ Detect architecture (x86_64 / arm64) + HVF (Hypervisor.framework)
+        ├─ Detect architecture (x86_64 / arm64) + HVF
         ├─ Create sparse qcow2 disk
-        ├─ QEMU VM: -cdrom ISO -boot order=cd   ← self-healing boot
-        ├─ noVNC → WebSocket :6080
+        ├─ QEMU VM: -boot order=cd + QMP socket + serial socket
+        ├─ aiohttp dashboard (:8080) — API + WebSocket + static UI
+        │     ├─ /api/vm/*         REST (status, power, keys, snapshot)
+        │     ├─ /ws/qmp           QMP events + live metrics
+        │     ├─ /ws/serial        serial console bridge (xterm.js)
+        │     └─ /ws/vnc           VNC bridge (embedded noVNC)
         └─ Cloudflare Quick Tunnel → https://xxx.trycloudflare.com
 ```
 
-Open the printed URL in any browser → see the VM → install the OS → reboot → the VM keeps working.
+One URL, one origin — dashboard, VM display, serial console, and API all live behind the same tunnel.
 
 ### Self-healing boot (no "no bootable device" trap)
 
-Every restart runs the **same** QEMU command with `-boot order=cd` — the firmware tries the **hard disk first**, and falls back to the **ISO** while the disk isn't bootable yet. So:
+Every restart runs the **same** QEMU command with `-boot order=cd` — the firmware tries the **hard disk first**, and falls back to the **ISO** while the disk isn't bootable yet:
 
 | Situation | Result |
 |---|---|
@@ -53,11 +57,11 @@ Every restart runs the **same** QEMU command with `-boot order=cd` — the firmw
 | Reboot inside the installed OS | Disk bootable → stays on the **installed OS** |
 | Disk permanently broken | Falls back to ISO; re-run the workflow for a fresh disk |
 
-No phase state machine, no assumption that "reboot = installer done" — the firmware decides.
+The dashboard's **installer monitor** watches the serial console and reports phase, progress, and failures — so you're never guessing why the screen went dark.
 
 ## Quick start
 
-1. **Fork** this repository (so you can run the workflow — Actions must run from your own fork).
+1. **Fork** this repository (Actions must run from your own fork).
 2. Go to **Actions → Universal VM Runner → Run workflow**.
 3. Fill in the inputs:
 
@@ -69,9 +73,38 @@ No phase state machine, no assumption that "reboot = installer done" — the fir
 | `disk_size` | no | `20G` | Virtual disk size (sparse qcow2) |
 | `keep_alive_minutes` | no | `360` | Session length (max 360) |
 
-4. Run, wait ~1–2 minutes, then open the **`https://…trycloudflare.com/vnc.html…`** URL printed in the `Run Universal VM` step log.
+4. Run, wait ~1–2 minutes, then open the **`https://…trycloudflare.com`** URL printed in the `Run Universal VM` step log — that's the dashboard.
 
 > Note: GitHub-hosted macOS runners are **free & unlimited on public repos**. The macOS label for **private** repos costs 10× Actions credits and is limited on the free plan.
+
+## Dashboard tour
+
+| Section | What you can do |
+|---|---|
+| **VM Display** | Embedded noVNC console with a QMP toolbar: Reset, Resume, Pause, Power off, send `Ctrl+Alt+Del`, F2, Esc, screenshot, create snapshot |
+| **Serial Terminal** | Interactive xterm.js console (plus a plain log view) — the most reliable way to watch an installer |
+| **Instrument panel** | Live power state, uptime, CPU % (with sparkline), RAM, disk written, installer phase, vCPU count |
+| **Snapshots** | List VM checkpoints (tag, size, date) |
+| **Configuration** | Expand & collapse of VM config + raw installer-monitor JSON |
+
+## API quick reference
+
+```
+GET  /api/vm/status              → QMP query-status
+GET  /api/vm/metrics             → aggregated CPU/RAM/disk readouts
+GET  /api/vm/installer           → installer state machine snapshot
+GET  /api/vm/snapshots           → snapshot list
+GET  /api/vm/screenshot          → latest PNG screendump
+POST /api/vm/power/{reset|powerdown|wakeup|quit}
+POST /api/vm/control/{pause|resume}
+POST /api/vm/send-key            → {"keys":["ctrl","alt","delete"]}
+POST /api/vm/snapshot            → {"tag":"my-checkpoint"}
+POST /api/vm/screendump          → capture a PNG
+GET  /ws/qmp                     → QMP events + 1s metrics push
+GET  /ws/serial                  → serial console (binary)
+GET  /ws/log                     → setup script task log
+GET  /ws/vnc                     → VNC bridge for noVNC
+```
 
 ## Good ISO choices
 
@@ -86,17 +119,17 @@ No phase state machine, no assumption that "reboot = installer done" — the fir
 The script detects acceleration at runtime:
 
 - **HVF** (`Hypervisor.framework`): used automatically when `sysctl kern.hv_support` returns `1` — current Intel VMware-esque runners expose it. Near-native speed.
-- **TCG** (software emulation): fallback — usable when the guest architecture **matches the runner** (x86_64 guest on x86_64 runner). A cross-arch mix (e.g. ARM64 ISO on the Intel runner) is very slow — avoid it.
+- **TCG** (software emulation): fallback — usable when the guest architecture **matches the runner**. A cross-arch mix (e.g. ARM64 ISO on the Intel runner) is very slow — avoid it.
 
 ## Honest caveats
 
 - **14 GB runner disk** — a >4 GB ISO plus a big qcow2 may not fit. Prefer slim/netinstall ISOs.
-- **HVF availability varies** across the runner fleet — the script probes it every run and auto-falls back to TCG.
+- **HVF availability varies** across the runner fleet — probed every run, auto-falls back to TCG.
 - **Brief VNC drop** during a VM reboot (a few seconds; noVNC auto-reconnects).
-- **ISO stays attached** in the installed OS — harmless (disk boots first); a Debian "remove installation media" prompt is informational only, Enter still boots your OS.
+- **ISO stays attached** in the installed OS — harmless (disk boots first); a Debian "remove installation media" prompt is informational only.
 - **Ephemeral disk** — the qcow2 lives on the runner and is lost when the workflow ends. No persistence yet.
 - **macOS guest ISOs unsupported** in this version (needs OpenCore bootloader config).
-- **Quick Tunnel URL is ephemeral** — dies with the workflow run (same lifecycle as the VM session).
+- **Quick Tunnel URL is ephemeral** — dies with the workflow run.
 
 ## SSH into the guest
 
@@ -113,11 +146,17 @@ ssh user@127.0.0.1 -p 8022   # from the run's shell
 | File | Purpose |
 |---|---|
 | `.github/workflows/vm-runner.yml` | GitHub Actions workflow: install QEMU + cloudflared, run the VM |
-| `scripts/qemu/setup-vm.sh` | Everything else: ISO download, arch/HVF detection, qcow2, noVNC + tunnel, QEMU reboot loop |
+| `scripts/qemu/setup-vm.sh` | ISO download, arch/HVF detection, qcow2, dashboard + tunnel, QEMU reboot loop |
+| `scripts/qemu/server/app.py` | aiohttp server: static UI + REST API + WebSockets |
+| `scripts/qemu/server/qmp_client.py` | QMP singleton, auto-reconnect, event broadcast |
+| `scripts/qemu/server/installer_monitor.py` | install state machine from serial patterns |
+| `scripts/qemu/server/api.py` | REST API routes |
+| `scripts/qemu/server/ws.py` | WebSocket handlers (+ serial manager) |
+| `scripts/qemu/server/fetch_vendor.sh` | fetch xterm.js + noVNC client assets |
 
 ## Installing on your own machine
 
-The workflow is the easy path, but the script itself works anywhere with QEMU + cloudflared:
+The workflow is the easy path, but the script works anywhere with QEMU + cloudflared:
 
 ```bash
 brew install qemu cloudflared     # macOS
@@ -134,7 +173,15 @@ universal-vm-runner/
 ├── .github/workflows/
 │   └── vm-runner.yml        # GitHub Actions workflow
 ├── scripts/qemu/
-│   └── setup-vm.sh          # QEMU lifecycle: ISO, disk, VM, noVNC, tunnel
+│   ├── setup-vm.sh          # QEMU lifecycle: ISO, disk, VM, dashboard, tunnel
+│   └── server/              # Python web dashboard
+│       ├── app.py
+│       ├── qmp_client.py
+│       ├── installer_monitor.py
+│       ├── api.py
+│       ├── ws.py
+│       ├── fetch_vendor.sh
+│       └── static/          # HTML/CSS/JS dashboard
 ├── README.md
 ├── README.id.md
 └── LICENSE                  # MIT

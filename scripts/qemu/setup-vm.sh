@@ -1,25 +1,34 @@
 #!/bin/bash
-# setup-vm.sh — Universal VM runner: QEMU + noVNC + Cloudflare Quick Tunnel
+# setup-vm.sh — Universal VM runner: QEMU + Dashboard UI + Cloudflare Quick Tunnel
 #
 # Alur:
 #   1. Download ISO dari URL yang diberikan user
 #   2. Deteksi arsitektur ISO (arm64 / x86_64)
 #   3. Buat disk image qcow2 (sparse allocation)
-#   4. Setup noVNC + websockify (port 6080 → VNC TCP 5900)
-#   5. Jalankan Cloudflare Quick Tunnel → URL publik
-#   6. Jalankan QEMU VM dengan -boot order=cd (disk dulu, fallback ISO — self-healing)
+#   4. Setup noVNC + websockify (internal) + web dashboard (aiohttp)
+#   5. Jalankan Cloudflare Quick Tunnel → URL publik (dashboard)
+#   6. Jalankan QEMU VM dengan QMP socket + serial socket + -boot order=cd
+#
+# Web interface:
+#   - Dashboard:     /            (aiohttp server, port 8080)
+#   - VM display:    embedded noVNC (via /ws/vnc bridge)
+#   - Serial console:xterm.js + /ws/serial bridge
+#   - API:           /api/vm/*
+#   - QMP:           unix:/tmp/qmp.sock
 #
 # Cara pakai (dari GitHub Actions):
 #   ISO_URL=https://... VM_MEMORY=2G VM_CPUS=2 DISK_SIZE=20G \
 #     ./scripts/qemu/setup-vm.sh
 #
-# Prasyarat: QEMU + cloudflared sudah terinstall (brew install qemu cloudflared).
+# Prasyarat: QEMU + cloudflared sudah terinstall (brew install qemu cloudflared),
+# python3 dengan aiohttp / psutil untuk server dashboard.
 #
 # Catatan:
-#   - QEMU VNC server di port 5900 (TCP), noVNC bridge ke WebSocket 6080.
+#   - QEMU VNC server di port 5900 (TCP), noVNC bridge ke WebSocket 6080 (internal).
+#   - Dashboard (aiohttp) di port 8080 — ini yang di-expose lewat tunnel.
+#   - QMP unix socket untuk kontrol VM (status, reset, snapshot, send-key, screendump).
+#   - Serial console via unix socket /tmp/serial.sock.
 #   - -no-reboot: QEMU exit saat guest reboot → loop restart perintah yang sama (self-healing).
-#   - -boot order=cd: SeaBIOS/EFI coba hard disk dulu, fallback ke ISO selagi disk belum bootable.
-#   - Quick Tunnel (TryCloudflare) gratis, URL acak, ephemeral.
 
 set -euo pipefail
 
@@ -56,6 +65,14 @@ ISO_FILE="${WORK_DIR}/installer.iso"
 DISK_FILE="${WORK_DIR}/disk.qcow2"
 NOVNC_DIR="/tmp/noVNC"
 SERIAL_LOG="${WORK_DIR}/vm-serial.log"
+SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/server"
+QMP_SOCK="/tmp/qmp.sock"
+SERIAL_SOCK="/tmp/serial.sock"
+VM_LOG_FILE="/tmp/vm-setup.log"
+WEB_SERVER_PORT=8080
+
+# Mirror setup-vm.sh output into the task log for the UI /ws/log stream.
+exec > >(tee -a "${VM_LOG_FILE}") 2>&1
 
 echo -e "${C_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
 echo -e "${C_CYAN}  ${C_BOLD}UNIVERSAL VM RUNNER - QEMU + noVNC + Cloudflare Tunnel${C_NC}"
@@ -182,9 +199,9 @@ DISK_ACTUAL=$(du -h "$DISK_FILE" | cut -f1)
 ok "Disk ready: ${DISK_ACTUAL} (sparse, grows on demand)"
 
 # ============================================================
-# STEP 5: SETUP noVNC + WEBSOCKIFY
+# STEP 5: SETUP noVNC + VENDOR ASSETS
 # ============================================================
-step 5 "Setting up noVNC..."
+step 5 "Setting up noVNC + web assets..."
 if [ ! -d "${NOVNC_DIR}/utils" ]; then
   git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR"
 fi
@@ -194,15 +211,52 @@ fi
 chmod +x "${NOVNC_DIR}/utils/novnc_proxy"
 ok "noVNC ready at ${NOVNC_DIR}"
 
+# Vendor xterm.js + noVNC client for the dashboard UI
+if command -v python3 >/dev/null 2>&1; then
+  bash "${SERVER_DIR}/fetch_vendor.sh"
+else
+  warn "python3 tidak ada — dashboard UI tidak akan berfungsi penuh."
+fi
+
+# Jika noVNC client belum ada di vendor (clone gagal), copy dari clone noVNC di /tmp
+if [ ! -f "${SERVER_DIR}/static/vendor/novnc/vnc.html" ] && [ -d "$NOVNC_DIR" ]; then
+  info "Menyalin noVNC client ke vendor directory..."
+  cp -R "$NOVNC_DIR"/* "${SERVER_DIR}/static/vendor/novnc/" 2>/dev/null || true
+fi
+
 # ============================================================
-# STEP 6: START noVNC PROXY + CLOUDFLARE TUNNEL
+# STEP 6: START WEB DASHBOARD + noVNC PROXY + CLOUDFLARE TUNNEL
 # ============================================================
-step 6 "Starting noVNC proxy + Cloudflare tunnel..."
+step 6 "Starting web dashboard + noVNC proxy + Cloudflare tunnel..."
 
 pkill -f "novnc_proxy" 2>/dev/null || true
 pkill -f "cloudflared tunnel" 2>/dev/null || true
+pkill -f "scripts/qemu/server/app.py" 2>/dev/null || true
+rm -f "${QMP_SOCK}" "${SERIAL_SOCK}"
 sleep 1
 
+# --- Start aiohttp dashboard server (single entry point) ---
+if command -v python3 >/dev/null 2>&1; then
+  ok "Menginstall Python dependencies (aiohttp, psutil)..."
+  pip3 install --quiet --upgrade aiohttp psutil 2>&1 | tail -2 || warn "pip install gagal — pakai fallback stdlib."
+
+  info "Memulai web dashboard di http://127.0.0.1:${WEB_SERVER_PORT}..."
+  nohup python3 "${SERVER_DIR}/app.py" \
+    > /tmp/dashboard.log 2>&1 &
+  DASH_PID=$!
+  sleep 2
+  if ! kill -0 "$DASH_PID" 2>/dev/null; then
+    fail "Dashboard server gagal start. Log:"
+    cat /tmp/dashboard.log
+    exit 1
+  fi
+  ok "Dashboard server running (PID: ${DASH_PID})"
+else
+  warn "python3 tidak tersedia — dashboard UI tidak aktif."
+  DASH_PID=""
+fi
+
+# --- Start noVNC proxy (internal — reachable via dashboard /ws/vnc bridge) ---
 nohup "${NOVNC_DIR}/utils/novnc_proxy" \
   --vnc localhost:5900 \
   --listen 127.0.0.1:6080 \
@@ -219,7 +273,11 @@ ok "noVNC proxy running (PID: ${NOVNC_PID})"
 
 TUNNEL_URL=""
 _start_cloudflared(){
-  nohup cloudflared tunnel --url http://127.0.0.1:6080 --no-autoupdate \
+  local target="http://127.0.0.1:${WEB_SERVER_PORT}"
+  if [ -z "$DASH_PID" ]; then
+    target="http://127.0.0.1:6080"
+  fi
+  nohup cloudflared tunnel --url "$target" --no-autoupdate \
     > /tmp/cf-tunnel.log 2>&1 &
   CF_PID=$!
 }
@@ -263,10 +321,11 @@ NOVNC_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=scale&reconnect=true&r
 
 echo ""
 echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
-echo -e "${C_GREEN}  Connect via noVNC: ${C_BOLD}${NOVNC_URL}${C_NC}"
+echo -e "${C_GREEN}  🌐 Web Dashboard: ${C_BOLD}${TUNNEL_URL}${C_NC}"
+echo -e "${C_GREEN}  (VM display, serial console, metrics, snapshots, QMP control)${C_NC}"
 echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
 echo ""
-echo "${NOVNC_URL}" > "${WORK_DIR}/novnc-url.txt"
+echo "${TUNNEL_URL}" > "${WORK_DIR}/novnc-url.txt"
 
 # ============================================================
 # STEP 7: WAIT FOR VNC PORT
@@ -293,8 +352,13 @@ QEMU_COMMON=(
   -device virtio-gpu-pci
   -device virtio-keyboard-pci
   -device virtio-mouse-pci
-  -serial "file:${SERIAL_LOG}"
+  -qmp "unix:${QMP_SOCK},server=on,wait=off"
+  -chardev "socket,id=serial0,path=${SERIAL_SOCK},server=on,wait=off"
+  -serial "chardev:serial0"
 )
+
+# Catatan: log serial ke file dikelola oleh SerialManager di dashboard server
+# (membaca socket QEMU dan menulis ke vm-serial.log + stream browser).
 
 RESTART_COUNT=0
 KEEP_ALIVE_SECONDS=$((KEEP_ALIVE_MINUTES * 60))
