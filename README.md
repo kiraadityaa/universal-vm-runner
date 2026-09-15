@@ -46,6 +46,18 @@ macOS runner (macos-15-intel: 4 vCPU / 14 GB RAM)
 
 One URL, one origin — dashboard, VM display, serial console, and API all live behind the same tunnel.
 
+### Technology stack
+
+| Layer | What we use | Why |
+|---|---|---|
+| **Web server** | [aiohttp](https://docs.aiohttp.org/) — one Python process on `:8080` | Serves the static UI **and** the REST API **and** every WebSocket endpoint, so one tunnel URL is enough |
+| **VM control** | Self-contained **asyncio QMP client** (stdlib only) | Speaks the QEMU Machine Protocol over `/tmp/qmp.sock`: `greeting → qmp_capabilities` handshake, id-matched replies, auto-reconnect when the runner loop restarts QEMU, and broadcast of async events (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). No `qemu.qmp` dependency, so the runner needs just `aiohttp` + `psutil` |
+| **Serial console** | [xterm.js](https://xtermjs.org/) over `/ws/serial` | Interactive terminal that works even when the guest GUI can't initialize |
+| **VM display** | noVNC bridged through `/ws/vnc` | The tunnel only exposes `:8080`, so a WebSocket adapter relays VNC frames to the embedded noVNC client |
+| **Instrument panel** | `psutil` + QMP `query-*` commands | Live host CPU/RAM and guest power/disk stats pushed every second |
+| **Installer monitoring** | Regex state machine on serial output | Classifies `booting → installing → ready / failed` without any guesswork |
+| **Public access** | Cloudflare Quick Tunnel → `:8080` | Public HTTPS URL, zero account, zero config |
+
 ### Self-healing boot (no "no bootable device" trap)
 
 Every restart runs the **same** QEMU command with `-boot order=cd` — the firmware tries the **hard disk first**, and falls back to the **ISO** while the disk isn't bootable yet:
@@ -148,7 +160,7 @@ ssh user@127.0.0.1 -p 8022   # from the run's shell
 | `.github/workflows/vm-runner.yml` | GitHub Actions workflow: install QEMU + cloudflared, run the VM |
 | `scripts/qemu/setup-vm.sh` | ISO download, arch/HVF detection, qcow2, dashboard + tunnel, QEMU reboot loop |
 | `scripts/qemu/server/app.py` | aiohttp server: static UI + REST API + WebSockets |
-| `scripts/qemu/server/qmp_client.py` | QMP singleton, auto-reconnect, event broadcast |
+| `scripts/qemu/server/qmp_client.py` | self-contained asyncio QMP client (no `qemu.qmp` dep), auto-reconnect, event broadcast |
 | `scripts/qemu/server/installer_monitor.py` | install state machine from serial patterns |
 | `scripts/qemu/server/api.py` | REST API routes |
 | `scripts/qemu/server/ws.py` | WebSocket handlers (+ serial manager) |
