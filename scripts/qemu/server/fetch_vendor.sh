@@ -10,37 +10,78 @@ mkdir -p "${VENDOR}/xterm" "${VENDOR}/novnc"
 C='\033[1;96m'; G='\033[0;32m'; Y='\033[1;33m'; N='\033[0m'
 echo -e "${C}[vendor] fetching xterm.js + noVNC${N}"
 
-# ---- xterm.js (UMD bundles, latest 5.x) ----
-XTERM_VER="${XTERM_VER:-5.3.0}"
-BASE="https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VER}/lib"
-for f in xterm.js xterm.css; do
-  if [ ! -f "${VENDOR}/xterm/${f}" ]; then
-    echo -e "  ${C}->${N} ${f} (v${XTERM_VER})"
-    curl -fsSL -o "${VENDOR}/xterm/${f}" "${BASE}/${f}" || {
-      echo -e "${Y}  first fetch failed, retrying raw.githubusercontent${N}"
-      curl -fsSL -o "${VENDOR}/xterm/${f}" \
-        "https://raw.githubusercontent.com/xtermjs/xterm.js/${XTERM_VER}/lib/${f}" || true
-    }
-  fi
-done
+# Versi xterm core dan addon rilis terpisah.
+XTERM_VER="${XTERM_VER:-5.5.0}"
+ADDON_FIT_VER="${ADDON_FIT_VER:-0.10.0}"
+ADDON_ATTACH_VER="${ADDON_ATTACH_VER:-0.11.0}"
 
-for f in xterm-addon-fit.js xterm-addon-attach.js; do
-  ADDON=$(echo "$f" | sed 's/xterm-//; s/\.js//')
+# fetch <dest> <url1> <url2> ... — coba mirror berurutan (jeda 1s untuk hindari rate-limit CDN).
+fetch() {
+  local dest="$1"; shift
+  local u
+  local first=1
+  for u in "$@"; do
+    if [ "$first" -eq 0 ]; then
+      sleep 1
+    fi
+    first=0
+    if curl -fsSL -o "$dest" "$u" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+fail=0
+
+# ---- xterm.js core (UMD bundles) ----
+fetch_core() {
+  local f="$1" p="$2"
   if [ ! -f "${VENDOR}/xterm/${f}" ]; then
     echo -e "  ${C}->${N} ${f} (v${XTERM_VER})"
-    curl -fsSL -o "${VENDOR}/xterm/${f}" \
-      "https://cdn.jsdelivr.net/npm/@xterm/${ADDON}@${XTERM_VER}/lib/${f}" || true
+    if ! fetch "${VENDOR}/xterm/${f}" \
+        "https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VER}/${p}" \
+        "https://unpkg.com/@xterm/xterm@${XTERM_VER}/${p}"; then
+      echo -e "  ${Y}!! ${f} gagal diunduh dari semua mirror${N}"
+      fail=1
+    fi
   fi
-done
+}
+fetch_core xterm.js lib/xterm.js
+fetch_core xterm.css css/xterm.css
+
+# ---- xterm.js addons ----
+fetch_addon() {
+  local name="$1" ver="$2"
+  local f="xterm-addon-${name}.js"
+  if [ ! -f "${VENDOR}/xterm/${f}" ]; then
+    echo -e "  ${C}->${N} ${f} (v${ver})"
+    if ! fetch "${VENDOR}/xterm/${f}" \
+        "https://cdn.jsdelivr.net/npm/@xterm/addon-${name}@${ver}/lib/addon-${name}.js" \
+        "https://unpkg.com/@xterm/addon-${name}@${ver}/lib/addon-${name}.js"; then
+      echo -e "  ${Y}!! ${f} gagal diunduh${N}"
+      fail=1
+    fi
+  fi
+}
+fetch_addon fit "$ADDON_FIT_VER"
+fetch_addon attach "$ADDON_ATTACH_VER"
 
 # ---- noVNC (client files only) ----
 if [ ! -f "${VENDOR}/novnc/vnc.html" ]; then
   echo -e "  ${C}->${N} noVNC (depth 1 clone)"
-  git clone --depth 1 https://github.com/novnc/noVNC.git "${VENDOR}/novnc" || {
-    echo -e "${Y}  clone failed — noVNC will be fetched by setup-vm.sh${N}"
+  git clone --depth 1 https://github.com/novnc/noVNC.git "${VENDOR}/novnc" >/dev/null 2>&1 || {
+    echo -e "${Y}  clone gagal — noVNC akan disiapkan setup-vm.sh${N}"
+    fail=1
   }
 fi
 
 echo -e "${G}[vendor] done${N}"
 echo "  vendor/xterm:  $(ls ${VENDOR}/xterm 2>/dev/null | tr '\n' ' ')"
-echo "  vendor/novnc:  $(test -f ${VENDOR}/novnc/vnc.html && echo 'present' || echo 'MISSING — run setup-vm.sh which clones noVNC')"
+if [ -f "${VENDOR}/novnc/vnc.html" ]; then
+  echo "  vendor/novnc:  present"
+else
+  echo "  vendor/novnc:  MISSING — akan diclone oleh setup-vm.sh"
+fi
+
+exit "$fail"

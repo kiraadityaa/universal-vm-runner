@@ -20,8 +20,9 @@
 #   ISO_URL=https://... VM_MEMORY=2G VM_CPUS=2 DISK_SIZE=20G \
 #     ./scripts/qemu/setup-vm.sh
 #
-# Prasyarat: QEMU + cloudflared sudah terinstall (brew install qemu cloudflared),
-# python3 dengan aiohttp / psutil untuk server dashboard.
+# Prasyarat: QEMU + cloudflared sudah terinstall (brew install qemu cloudflared).
+# Dashboard butuh python3; aiohttp/psutil diinstall otomatis
+# (rantai: virtualenv -> user-site --break-system-packages -> Homebrew).
 #
 # Catatan:
 #   - QEMU VNC server di port 5900 (TCP), noVNC bridge ke WebSocket 6080 (internal).
@@ -75,7 +76,7 @@ WEB_SERVER_PORT=8080
 exec > >(tee -a "${VM_LOG_FILE}") 2>&1
 
 echo -e "${C_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
-echo -e "${C_CYAN}  ${C_BOLD}UNIVERSAL VM RUNNER - QEMU + noVNC + Cloudflare Tunnel${C_NC}"
+echo -e "${C_CYAN}  ${C_BOLD}UNIVERSAL VM RUNNER - WEB DASHBOARD + QEMU + CLOUDFLARE${C_NC}"
 echo -e "${C_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
 echo ""
 echo -e "  ${C_BLUE}ISO:${C_NC}       ${ISO_URL}"
@@ -203,17 +204,21 @@ ok "Disk ready: ${DISK_ACTUAL} (sparse, grows on demand)"
 # ============================================================
 step 5 "Setting up noVNC + web assets..."
 if [ ! -d "${NOVNC_DIR}/utils" ]; then
-  git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR"
+  if ! git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR" >/dev/null 2>&1; then
+    warn "Clone noVNC gagal — konsol VNC mungkin tidak tersedia."
+  fi
 fi
 if [ ! -d "${NOVNC_DIR}/utils/websockify" ]; then
-  git clone --depth 1 https://github.com/novnc/websockify.git "${NOVNC_DIR}/utils/websockify"
+  if ! git clone --depth 1 https://github.com/novnc/websockify.git "${NOVNC_DIR}/utils/websockify" >/dev/null 2>&1; then
+    warn "Clone websockify gagal — proxy VNC tidak tersedia."
+  fi
 fi
-chmod +x "${NOVNC_DIR}/utils/novnc_proxy"
-ok "noVNC ready at ${NOVNC_DIR}"
+chmod +x "${NOVNC_DIR}/utils/novnc_proxy" 2>/dev/null || true
+ok "noVNC selesai ditata (${NOVNC_DIR})"
 
 # Vendor xterm.js + noVNC client for the dashboard UI
 if command -v python3 >/dev/null 2>&1; then
-  bash "${SERVER_DIR}/fetch_vendor.sh"
+  bash "${SERVER_DIR}/fetch_vendor.sh" || warn "Vendor assets gagal diunduh — UI serial console mungkin terbatas."
 else
   warn "python3 tidak ada — dashboard UI tidak akan berfungsi penuh."
 fi
@@ -235,54 +240,99 @@ pkill -f "scripts/qemu/server/app.py" 2>/dev/null || true
 rm -f "${QMP_SOCK}" "${SERIAL_SOCK}"
 sleep 1
 
-# --- Start aiohttp dashboard server (single entry point) ---
-if command -v python3 >/dev/null 2>&1; then
-  ok "Menginstall Python dependencies (aiohttp, psutil)..."
-  pip3 install --quiet --upgrade aiohttp psutil 2>&1 | tail -2 || warn "pip install gagal — pakai fallback stdlib."
-
-  info "Memulai web dashboard di http://127.0.0.1:${WEB_SERVER_PORT}..."
-  nohup python3 "${SERVER_DIR}/app.py" \
-    > /tmp/dashboard.log 2>&1 &
-  DASH_PID=$!
-  sleep 2
-  if ! kill -0 "$DASH_PID" 2>/dev/null; then
-    fail "Dashboard server gagal start. Log:"
-    cat /tmp/dashboard.log
-    exit 1
+# --- Prepare Python environment for dashboard (aiohttp + psutil) ---
+# PEP 668 (externally-managed) memblokir pip sistem; rantai: venv ->
+# user-site --break-system-packages -> plain --user -> Homebrew python.
+PY=""
+setup_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    # 1) virtualenv — terisolasi, bebas batasan PEP 668
+    if python3 -m venv /tmp/uvm-venv >/dev/null 2>&1; then
+      /tmp/uvm-venv/bin/python -m pip install --quiet --upgrade aiohttp psutil >/dev/null 2>&1 \
+        && /tmp/uvm-venv/bin/python -c "import aiohttp, psutil" >/dev/null 2>&1 \
+        && { PY=/tmp/uvm-venv/bin/python; return 0; }
+    fi
+    # 2) user-site dengan --break-system-packages (lewatkan PEP 668)
+    python3 -m pip install --quiet --user --break-system-packages --upgrade aiohttp psutil >/dev/null 2>&1 \
+      && python3 -c "import aiohttp, psutil" >/dev/null 2>&1 \
+      && { PY="$(command -v python3)"; return 0; }
+    # 3) plain --user (pip lama tanpa opsi --break-system-packages)
+    python3 -m pip install --quiet --user --upgrade aiohttp psutil >/dev/null 2>&1 \
+      && python3 -c "import aiohttp, psutil" >/dev/null 2>&1 \
+      && { PY="$(command -v python3)"; return 0; }
+    # 4) Homebrew python (biasanya tidak externally-managed)
+    if command -v brew >/dev/null 2>&1; then
+      local brew_py="$(brew --prefix 2>/dev/null)/bin/python3"
+      if [ -x "$brew_py" ]; then
+        "$brew_py" -m pip install --quiet --upgrade aiohttp psutil >/dev/null 2>&1 \
+          && "$brew_py" -c "import aiohttp, psutil" >/dev/null 2>&1 \
+          && { PY="$brew_py"; return 0; }
+      fi
+    fi
   fi
-  ok "Dashboard server running (PID: ${DASH_PID})"
+  return 1
+}
+
+dash_start_ok() {
+  nohup "$1" -u "${SERVER_DIR}/app.py" > /tmp/dashboard.log 2>&1 &
+  DASH_PID=$!
+  sleep 3
+  kill -0 "$DASH_PID" 2>/dev/null || return 1
+  for _ in 1 2 3 4 5; do
+    curl -sf "http://127.0.0.1:${WEB_SERVER_PORT}/api/config" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+DASH_PID=""
+TUNNEL_TARGET="http://127.0.0.1:6080"   # fallback default: raw noVNC
+
+info "Menyiapkan environment Python (aiohttp + psutil) untuk dashboard..."
+if setup_python && [ -n "$PY" ]; then
+  ok "Python siap: ${PY}"
+  info "Memulai web dashboard di http://127.0.0.1:${WEB_SERVER_PORT}..."
+  if dash_start_ok "$PY"; then
+    ok "Dashboard server running (PID: ${DASH_PID}, port ${WEB_SERVER_PORT})"
+    TUNNEL_TARGET="http://127.0.0.1:${WEB_SERVER_PORT}"
+  else
+    warn "Dashboard server gagal merespons — tunnel dialihkan ke noVNC (:6080). Log:"
+    tail -n 15 /tmp/dashboard.log 2>/dev/null | sed 's/^/    /' || true
+    DASH_PID=""
+  fi
 else
-  warn "python3 tidak tersedia — dashboard UI tidak aktif."
-  DASH_PID=""
+  warn "aiohttp/psutil tidak tersedia — dashboard web nonaktif; tunnel langsung ke noVNC (:6080)."
 fi
 
 # --- Start noVNC proxy (internal — reachable via dashboard /ws/vnc bridge) ---
-nohup "${NOVNC_DIR}/utils/novnc_proxy" \
-  --vnc localhost:5900 \
-  --listen 127.0.0.1:6080 \
-  > /tmp/novnc.log 2>&1 &
-NOVNC_PID=$!
-sleep 2
-
-if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
-  fail "noVNC proxy failed to start. Log:"
-  cat /tmp/novnc.log
-  exit 1
-fi
-ok "noVNC proxy running (PID: ${NOVNC_PID})"
-
-TUNNEL_URL=""
-_start_cloudflared(){
-  local target="http://127.0.0.1:${WEB_SERVER_PORT}"
-  if [ -z "$DASH_PID" ]; then
-    target="http://127.0.0.1:6080"
+NOVNC_PID=""
+if [ -x "${NOVNC_DIR}/utils/novnc_proxy" ]; then
+  nohup "${NOVNC_DIR}/utils/novnc_proxy" \
+    --vnc localhost:5900 \
+    --listen 127.0.0.1:6080 \
+    > /tmp/novnc.log 2>&1 &
+  NOVNC_PID=$!
+  sleep 2
+  if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
+    warn "noVNC proxy gagal start. Log:"
+    tail -n 15 /tmp/novnc.log 2>/dev/null | sed 's/^/    /' || true
+    NOVNC_PID=""
+  else
+    ok "noVNC proxy running (PID: ${NOVNC_PID})"
   fi
-  nohup cloudflared tunnel --url "$target" --no-autoupdate \
+else
+  warn "novnc_proxy tidak tersedia — akses VNC langsung tidak aktif."
+fi
+
+# --- Start Cloudflare Quick Tunnel (target: dashboard, fallback: raw noVNC) ---
+TUNNEL_URL=""
+_start_cloudflared() {
+  nohup cloudflared tunnel --url "$TUNNEL_TARGET" --no-autoupdate \
     > /tmp/cf-tunnel.log 2>&1 &
   CF_PID=$!
 }
 
-_wait_for_tunnel(){
+_wait_for_tunnel() {
   local max_wait=$1 label=$2
   info "Menunggu Cloudflare tunnel URL (maks ${max_wait}s)... "
   for i in $(seq 1 "$max_wait"); do
@@ -304,26 +354,33 @@ _wait_for_tunnel(){
   return 1
 }
 
-_start_cloudflared
-if ! _wait_for_tunnel 120 "first"; then
-  warn "Percobaan pertama gagal — retry dengan cloudflared baru..."
-  pkill -f "cloudflared tunnel" 2>/dev/null || true
-  sleep 3
+if command -v cloudflared >/dev/null 2>&1; then
+  info "Memulai tunnel ke ${TUNNEL_TARGET}..."
   _start_cloudflared
-  if ! _wait_for_tunnel 60 "retry"; then
-    fail "Cloudflare tunnel gagal setelah 2 percobaan. Full log:"
-    cat /tmp/cf-tunnel.log 2>/dev/null || echo "(log kosong)"
-    exit 1
+  if ! _wait_for_tunnel 120 "first"; then
+    warn "Percobaan pertama gagal — retry dengan cloudflared baru..."
+    pkill -f "cloudflared tunnel" 2>/dev/null || true
+    sleep 3
+    _start_cloudflared
+    if ! _wait_for_tunnel 60 "retry"; then
+      warn "Cloudflare tunnel gagal setelah 2 percobaan. Log:"
+      tail -n 20 /tmp/cf-tunnel.log 2>/dev/null | sed 's/^/    /' || true
+      TUNNEL_URL=""
+    fi
   fi
+else
+  warn "cloudflared tidak tersedia — tidak ada URL publik; VM tetap akan dijalankan."
 fi
 
-NOVNC_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000"
-
 echo ""
-echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
-echo -e "${C_GREEN}  🌐 Web Dashboard: ${C_BOLD}${TUNNEL_URL}${C_NC}"
-echo -e "${C_GREEN}  (VM display, serial console, metrics, snapshots, QMP control)${C_NC}"
-echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+if [ -n "$TUNNEL_URL" ]; then
+  echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+  echo -e "${C_GREEN}  🌐 Web Dashboard: ${C_BOLD}${TUNNEL_URL}${C_NC}"
+  echo -e "${C_GREEN}  (VM display, serial console, metrics, snapshots, QMP control)${C_NC}"
+  echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+else
+  warn "Tidak ada URL publik kali ini — akses web terbatas, VM tetap dijalankan."
+fi
 echo ""
 echo "${TUNNEL_URL}" > "${WORK_DIR}/novnc-url.txt"
 

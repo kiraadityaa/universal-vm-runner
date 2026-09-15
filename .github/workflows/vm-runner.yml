@@ -170,6 +170,23 @@ jobs:
           du -h "$GITHUB_WORKSPACE/installer.iso" 2>/dev/null || true
 
           echo ""
+          echo -e "${C_CYAN}[4.5/8] PYTHON ENVIRONMENT${C_NC}"
+          command -v python3 || echo "  (python3 tidak ada)"
+          python3 --version 2>/dev/null || true
+          command -v pip3 || echo "  (pip3 tidak ada)"
+          python3 -m pip --version 2>/dev/null | head -1 || echo "  (modul pip python3 tidak tersedia)"
+          echo "  aiohttp/psutil (python3 default):"
+          python3 -c "import aiohttp, psutil; print('    OK aiohttp=' + aiohttp.__version__ + ' psutil=' + psutil.__version__)" 2>&1 | head -3
+          if [ -x /tmp/uvm-venv/bin/python ]; then
+            echo "  virtualenv /tmp/uvm-venv:"
+            /tmp/uvm-venv/bin/python -c "import aiohttp, psutil; print('    OK aiohttp=' + aiohttp.__version__ + ' psutil=' + psutil.__version__)" 2>&1 | head -3
+          else
+            echo "  virtualenv /tmp/uvm-venv: (tidak dibuat)"
+          fi
+          echo "  vendor xterm:"
+          ls "$GITHUB_WORKSPACE/scripts/qemu/server/static/vendor/xterm" 2>/dev/null | tr '\n' ' '; echo ""
+
+          echo ""
           echo -e "${C_CYAN}[5/8] VNC / DASHBOARD / QMP STATUS${C_NC}"
           echo "  nc -z -G 2 127.0.0.1 5900 (QEMU VNC):"
           if nc -z -G 2 127.0.0.1 5900 >/dev/null 2>&1; then
