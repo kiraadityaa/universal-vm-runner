@@ -17,7 +17,7 @@ Pengen menjalankan distro Linux di cloud, main-main installer, mencoba live ISO,
 
 **Universal VM Runner** menjalankan emulator QEMU di **runner macOS Intel gratis dari GitHub** (4 vCPU / 14 GB RAM di repo publik) dan meng-expose **dashboard manajemen web yang lengkap**:
 
-- 🖥️ **Tampilan VM** — noVNC tertanam, resize sesuai permintaan
+- 🖥️ **Tampilan VM** — direct noVNC, layar penuh via tunnel terpisah
 - ⌨️ **Toolbar kontrol QMP** — reset, matikan, pause/resume, `Ctrl+Alt+Del`, F2, screenshot, snapshot
 - 🔌 **Konsol serial interaktif** — xterm.js lewat WebSocket (tetap jalan walau GUI tidak bisa init)
 - 📊 **Instrumen live** — status daya, uptime, beban CPU, RAM, I/O disk, jumlah vCPU
@@ -39,24 +39,25 @@ Runner macOS (macos-15-intel: 4 vCPU / 14 GB RAM)
         ├─ Dashboard aiohttp (:8080) — API + WebSocket + static UI
         │     ├─ /api/vm/*         REST (status, power, keys, snapshot)
         │     ├─ /ws/qmp           event QMP + metrik live
-        │     ├─ /ws/serial        konsol serial (xterm.js)
-        │     └─ /ws/vnc           bridge VNC (noVNC tertanam)
-        └─ Cloudflare Quick Tunnel → https://xxx.trycloudflare.com
+        │     └─ /ws/serial        konsol serial (xterm.js)
+        ├─ novnc_proxy (:6080) — noVNC / websockify mentah → VNC QEMU :5900
+        ├─ Cloudflare Quick Tunnel #1 → :8080  (kontrol dashboard)
+        └─ Cloudflare Quick Tunnel #2 → :6080  (noVNC langsung, layar penuh)
 ```
 
-Satu URL, satu origin — dashboard, tampilan VM, konsol serial, dan API semuanya berada di belakang tunnel yang sama.
+Dua URL, dua peran — **kontrol dashboard** dan **direct noVNC** masing-masing punya link HTTPS publik sendiri.
 
 ### Teknologi di baliknya
 
 | Lapisan | Yang dipakai | Alasannya |
 |---|---|---|
-| **Server web** | [aiohttp](https://docs.aiohttp.org/) — satu proses Python di `:8080` | Menyajikan UI statis **dan** REST API **dan** semua endpoint WebSocket, jadi satu URL tunnel sudah cukup |
+| **Server web** | [aiohttp](https://docs.aiohttp.org/) — satu proses Python di `:8080` | Menyajikan UI statis **dan** REST API **dan** semua endpoint WebSocket untuk kontrol dashboard |
 | **Kontrol VM** | **Klien QMP asyncio mandiri** (stdlib saja) | Berbicara ke QEMU Machine Protocol lewat `/tmp/qmp.sock`: handshake `greeting → qmp_capabilities`, reply dicocokkan berdasar id, auto-reconnect saat loop runner me-restart QEMU, dan broadcast event async (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). Tanpa dependency `qemu.qmp` — runner cukup butuh `aiohttp` + `psutil` |
 | **Konsol serial** | [xterm.js](https://xtermjs.org/) lewat `/ws/serial` | Terminal interaktif yang tetap berguna walau GUI guest gagal init |
-| **Tampilan VM** | noVNC di-bridge lewat `/ws/vnc` | Tunnel hanya meng-expose `:8080`, jadi adapter WebSocket meneruskan frame VNC ke klien noVNC tertanam |
+| **Tampilan VM** | **Direct noVNC** via `novnc_proxy` di `:6080` | Cloudflare Quick Tunnel terpisah meng-expose klien noVNC mentah layar penuh, independen dari dashboard |
 | **Panel instrumen** | `psutil` + perintah QMP `query-*` | Statistik CPU/RAM host serta daya/disk guest, dikirim tiap detik |
 | **Monitoring installer** | State machine regex pada output serial | Mengklasifikasikan `booting → installing → ready / failed` tanpa menebak-nebak |
-| **Akses publik** | Cloudflare Quick Tunnel → `:8080` | URL HTTPS publik, tanpa akun, tanpa konfigurasi |
+| **Akses publik** | **Dua** Cloudflare Quick Tunnel → `:8080` + `:6080` | URL HTTPS publik, tanpa akun, tanpa konfigurasi — satu untuk kontrol dashboard, satu untuk direct noVNC |
 
 ### Boot self-healing (tanpa jebakan "no bootable device")
 
@@ -85,7 +86,7 @@ Setiap restart menjalankan perintah QEMU **yang sama** dengan `-boot order=cd` �
 | `disk_size` | tidak | `20G` | Ukuran disk virtual (qcow2 sparse) |
 | `keep_alive_minutes` | tidak | `360` | Lama sesi (maks 360) |
 
-4. Jalankan, tunggu ~1–2 menit, lalu buka URL **`https://…trycloudflare.com`** yang tercetak di log langkah `Run Universal VM` — itulah dashboard-nya.
+4. Jalankan, tunggu ~1–2 menit, lalu buka **dua URL `https://…trycloudflare.com`** yang tercetak di log langkah `Run Universal VM` — satu untuk link kontrol dashboard, satu untuk link noVNC (`/vnc.html?autoconnect` untuk direct noVNC). Dashboard juga menampilkan link noVNC langsung di panel VM Display.
 
 > Catatan: runner macOS GitHub **gratis & unlimited di repo publik**. Di repo **privat**, label macOS dihitung 10× kredit Actions dan dibatasi di paket gratis.
 
@@ -93,7 +94,7 @@ Setiap restart menjalankan perintah QEMU **yang sama** dengan `-boot order=cd` �
 
 | Bagian | Yang bisa Anda lakukan |
 |---|---|
-| **Tampilan VM** | Konsol noVNC tertanam dengan toolbar QMP: Reset, Resume, Pause, Matikan, kirim `Ctrl+Alt+Del`, F2, Esc, screenshot, buat snapshot |
+| **Tampilan VM** | Tombol **Open noVNC — layar penuh** yang melompat ke tunnel noVNC langsung (klien layar penuh di tab baru); toolbar QMP: Reset, Resume, Pause, Matikan, kirim `Ctrl+Alt+Del`, F2, Esc, screenshot, buat snapshot |
 | **Terminal serial** | Konsol xterm.js interaktif (plus tampilan log polos) — cara paling andal untuk mengamati installer |
 | **Panel instrumen** | Status daya live, uptime, CPU % (dengan sparkline), RAM, disk tertulis, fase installer, jumlah vCPU |
 | **Snapshot** | Daftar checkpoint VM (tag, ukuran, tanggal) |
@@ -115,7 +116,7 @@ POST /api/vm/screendump          → ambil PNG
 GET  /ws/qmp                     → event QMP + push metrik tiap 1 detik
 GET  /ws/serial                  → konsol serial (biner)
 GET  /ws/log                     → log tugas setup
-GET  /ws/vnc                     → bridge VNC untuk noVNC
+GET  /ws/vnc                     → bridge VNC (cadangan — UI memakai tunnel noVNC langsung)
 ```
 
 ## Pilihan ISO yang pas

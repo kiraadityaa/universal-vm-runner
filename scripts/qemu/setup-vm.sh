@@ -6,7 +6,7 @@
 #   2. Deteksi arsitektur ISO (arm64 / x86_64)
 #   3. Buat disk image qcow2 (sparse allocation)
 #   4. Setup noVNC + websockify (internal) + web dashboard (aiohttp)
-#   5. Jalankan Cloudflare Quick Tunnel → URL publik (dashboard)
+#   5. Jalankan DUA Cloudflare Quick Tunnel → dashboard control + direct noVNC
 #   6. Jalankan QEMU VM dengan QMP socket + serial socket + -boot order=cd
 #
 # Web interface:
@@ -26,7 +26,8 @@
 #
 # Catatan:
 #   - QEMU VNC server di port 5900 (TCP), noVNC bridge ke WebSocket 6080 (internal).
-#   - Dashboard (aiohttp) di port 8080 — ini yang di-expose lewat tunnel.
+#   - Dashboard (aiohttp) di port 8080 — tunnel "dashboard" (kontrol + serial + snapshot + QMP).
+#   - noVNC proxy di port 6080 — tunnel "novnc" (layar penuh, vnc.html?autoconnect=true).
 #   - QMP unix socket untuk kontrol VM (status, reset, snapshot, send-key, screendump).
 #   - Serial console via unix socket /tmp/serial.sock.
 #   - -no-reboot: QEMU exit saat guest reboot → loop restart perintah yang sama (self-healing).
@@ -62,6 +63,7 @@ DISK_SIZE="${DISK_SIZE:-20G}"
 KEEP_ALIVE_MINUTES="${KEEP_ALIVE_MINUTES:-360}"
 
 WORK_DIR="${WORK_DIR:-$(pwd)}"
+export WORK_DIR
 ISO_FILE="${WORK_DIR}/installer.iso"
 DISK_FILE="${WORK_DIR}/disk.qcow2"
 NOVNC_DIR="/tmp/noVNC"
@@ -286,7 +288,6 @@ dash_start_ok() {
 }
 
 DASH_PID=""
-TUNNEL_TARGET="http://127.0.0.1:6080"   # fallback default: raw noVNC
 
 info "Menyiapkan environment Python (aiohttp + psutil) untuk dashboard..."
 if setup_python && [ -n "$PY" ]; then
@@ -294,14 +295,13 @@ if setup_python && [ -n "$PY" ]; then
   info "Memulai web dashboard di http://127.0.0.1:${WEB_SERVER_PORT}..."
   if dash_start_ok "$PY"; then
     ok "Dashboard server running (PID: ${DASH_PID}, port ${WEB_SERVER_PORT})"
-    TUNNEL_TARGET="http://127.0.0.1:${WEB_SERVER_PORT}"
   else
-    warn "Dashboard server gagal merespons — tunnel dialihkan ke noVNC (:6080). Log:"
+    warn "Dashboard server gagal merespons. Log:"
     tail -n 15 /tmp/dashboard.log 2>/dev/null | sed 's/^/    /' || true
     DASH_PID=""
   fi
 else
-  warn "aiohttp/psutil tidak tersedia — dashboard web nonaktif; tunnel langsung ke noVNC (:6080)."
+  warn "aiohttp/psutil tidak tersedia — dashboard web nonaktif."
 fi
 
 # --- Start noVNC proxy (internal — reachable via dashboard /ws/vnc bridge) ---
@@ -324,65 +324,91 @@ else
   warn "novnc_proxy tidak tersedia — akses VNC langsung tidak aktif."
 fi
 
-# --- Start Cloudflare Quick Tunnel (target: dashboard, fallback: raw noVNC) ---
+# --- Cloudflare Quick Tunnels: dashboard (8080) + direct noVNC (6080) ---
 TUNNEL_URL=""
-_start_cloudflared() {
-  nohup cloudflared tunnel --url "$TUNNEL_TARGET" --no-autoupdate \
-    > /tmp/cf-tunnel.log 2>&1 &
+_spawn_tunnel() {  # $1=logfile $2=target
+  nohup cloudflared tunnel --url "$2" --no-autoupdate > "$1" 2>&1 &
   CF_PID=$!
 }
 
-_wait_for_tunnel() {
-  local max_wait=$1 label=$2
-  info "Menunggu Cloudflare tunnel URL (maks ${max_wait}s)... "
-  for i in $(seq 1 "$max_wait"); do
+_wait_tunnel() {  # $1=logfile $2=target $3=maxwait $4=label ; sets TUNNEL_URL
+  local log="$1" target="$2" maxwait="$3" label="$4" i
+  TUNNEL_URL=""
+  info "Menunggu tunnel ${label} (maks ${maxwait}s)... "
+  for i in $(seq 1 "$maxwait"); do
     if ! kill -0 "$CF_PID" 2>/dev/null; then
-      warn "cloudflared mati di detik ${i}. Restarting..."
-      _start_cloudflared
+      warn "cloudflared (${label}) mati di detik ${i}. Restarting..."
+      _spawn_tunnel "$log" "$target"
     fi
-    TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf-tunnel.log | head -1)
+    TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$log" | head -1)
     if [ -n "$TUNNEL_URL" ]; then
-      ok "Tunnel URL diterima di detik ${i}."
+      ok "Tunnel ${label}: ${TUNNEL_URL}"
       return 0
     fi
     if [ $((i % 15)) -eq 0 ]; then
-      warn "Belum ada URL (${i}/${max_wait}s). Log cloudflared:"
-      tail -5 /tmp/cf-tunnel.log 2>/dev/null | sed 's/^/    /' || true
+      warn "${label}: belum ada URL (${i}/${maxwait}s). Log:"
+      tail -5 "$log" 2>/dev/null | sed 's/^/    /' || true
     fi
     sleep 1
   done
   return 1
 }
 
-if command -v cloudflared >/dev/null 2>&1; then
-  info "Memulai tunnel ke ${TUNNEL_TARGET}..."
-  _start_cloudflared
-  if ! _wait_for_tunnel 120 "first"; then
-    warn "Percobaan pertama gagal — retry dengan cloudflared baru..."
-    pkill -f "cloudflared tunnel" 2>/dev/null || true
-    sleep 3
-    _start_cloudflared
-    if ! _wait_for_tunnel 60 "retry"; then
-      warn "Cloudflare tunnel gagal setelah 2 percobaan. Log:"
-      tail -n 20 /tmp/cf-tunnel.log 2>/dev/null | sed 's/^/    /' || true
-      TUNNEL_URL=""
+run_tunnel() {  # $1=name $2=target $3=logfile $4=outfile
+  local name="$1" target="$2" log="$3" outfile="$4"
+  TUNNEL_URL=""
+  if command -v cloudflared >/dev/null 2>&1; then
+    info "Tunnel ${name}: memulai cloudflared -> ${target}"
+    _spawn_tunnel "$log" "$target"
+    if ! _wait_tunnel "$log" "$target" 120 "$name"; then
+      warn "${name}: percobaan pertama gagal — retry dengan cloudflared baru..."
+      pkill -f "cloudflared tunnel --url ${target}" 2>/dev/null || true
+      sleep 3
+      _spawn_tunnel "$log" "$target"
+      if ! _wait_tunnel "$log" "$target" 60 "$name"; then
+        warn "${name}: tunnel gagal setelah 2 percobaan. Log:"
+        tail -n 20 "$log" 2>/dev/null | sed 's/^/    /' || true
+        TUNNEL_URL=""
+      fi
     fi
+  else
+    warn "cloudflared tidak tersedia — tunnel ${name} dilewati."
   fi
+  echo "${TUNNEL_URL}" > "$outfile"
+}
+
+DASH_URL=""
+VNC_URL=""
+if [ -n "$DASH_PID" ]; then
+  run_tunnel dashboard "http://127.0.0.1:${WEB_SERVER_PORT}" \
+    /tmp/cf-dashboard.log "${WORK_DIR}/dashboard-url.txt"
+  DASH_URL="$TUNNEL_URL"
 else
-  warn "cloudflared tidak tersedia — tidak ada URL publik; VM tetap akan dijalankan."
+  : > "${WORK_DIR}/dashboard-url.txt"
+fi
+if [ -n "$NOVNC_PID" ]; then
+  run_tunnel novnc "http://127.0.0.1:6080" \
+    /tmp/cf-novnc.log "${WORK_DIR}/novnc-url.txt"
+  VNC_URL="$TUNNEL_URL"
+else
+  : > "${WORK_DIR}/novnc-url.txt"
 fi
 
 echo ""
-if [ -n "$TUNNEL_URL" ]; then
-  echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
-  echo -e "${C_GREEN}  🌐 Web Dashboard: ${C_BOLD}${TUNNEL_URL}${C_NC}"
-  echo -e "${C_GREEN}  (VM display, serial console, metrics, snapshots, QMP control)${C_NC}"
-  echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+if [ -n "$DASH_URL" ]; then
+  echo -e "${C_GREEN}  🌐 Dashboard Control:  ${C_BOLD}${DASH_URL}${C_NC}"
 else
-  warn "Tidak ada URL publik kali ini — akses web terbatas, VM tetap dijalankan."
+  echo -e "${C_YELLOW}  🌐 Dashboard Control:  (tidak tersedia)${C_NC}"
 fi
+if [ -n "$VNC_URL" ]; then
+  echo -e "${C_GREEN}  🖥️   Direct noVNC:      ${C_BOLD}${VNC_URL}/vnc.html?autoconnect=true&resize=scale${C_NC}"
+else
+  echo -e "${C_YELLOW}  🖥️   Direct noVNC:      (tidak tersedia)${C_NC}"
+fi
+echo -e "${C_GREEN}  (dashboard: kontrol VM + serial + snapshot + QMP | noVNC: layar penuh)${C_NC}"
+echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
 echo ""
-echo "${TUNNEL_URL}" > "${WORK_DIR}/novnc-url.txt"
 
 # ============================================================
 # STEP 7: WAIT FOR VNC PORT
@@ -470,5 +496,5 @@ done
 
 echo ""
 echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
-echo -e "${C_GREEN}  Session ended. Tunnel: ${TUNNEL_URL}${C_NC}"
+echo -e "${C_GREEN}  Session ended. Dashboard: ${DASH_URL}  |  noVNC: ${VNC_URL}${C_NC}"
 echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"

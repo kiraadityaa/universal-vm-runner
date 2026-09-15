@@ -216,9 +216,23 @@ def routes() -> web.RouteTableDef:
         # Strip URL params for display safety.
         url = env["ISO_URL"]
         env["ISO_URL_DISPLAY"] = url.split("?")[0] if url else ""
+        # Tunnel URLs are discovered per-request from files written by setup-vm.sh.
+        env["dashboard_url"] = _read_url_file(
+            os.path.join(os.environ.get("WORK_DIR", "."), "dashboard-url.txt")
+        )
+        env["vnc_url"] = _read_url_file(
+            os.path.join(os.environ.get("WORK_DIR", "."), "novnc-url.txt")
+        )
         return web.json_response(env)
 
     return routes
+
+
+def _read_url_file(path: str) -> str:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
 
 
 def _parse_snapshot_list(text: str) -> list[dict]:

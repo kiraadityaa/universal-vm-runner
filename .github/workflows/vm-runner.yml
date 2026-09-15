@@ -222,11 +222,15 @@ jobs:
           tail -n 10 "$GITHUB_WORKSPACE/vm-serial.log" 2>/dev/null || echo "    (tidak ada)"
 
           echo ""
-          echo -e "${C_CYAN}[6/8] CLOUDFLARE TUNNEL${C_NC}"
+          echo -e "${C_CYAN}[6/8] CLOUDFLARE TUNNELS (dashboard + noVNC)${C_NC}"
+          echo "  dashboard-url.txt:"
+          cat "$GITHUB_WORKSPACE/dashboard-url.txt" 2>/dev/null || echo "    (tidak ada)"
           echo "  novnc-url.txt:"
           cat "$GITHUB_WORKSPACE/novnc-url.txt" 2>/dev/null || echo "    (tidak ada)"
-          echo "  cloudflared.log (last 15):"
-          tail -n 15 /tmp/cf-tunnel.log 2>/dev/null || echo "    (tidak ada)"
+          echo "  cloudflared dashboard.log (last 15):"
+          tail -n 15 /tmp/cf-dashboard.log 2>/dev/null || echo "    (tidak ada)"
+          echo "  cloudflared noVNC.log (last 15):"
+          tail -n 15 /tmp/cf-novnc.log 2>/dev/null || echo "    (tidak ada)"
 
           echo ""
           echo -e "${C_CYAN}[7/8] RUNNING PROCESSES${C_NC}"

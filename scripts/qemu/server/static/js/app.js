@@ -42,34 +42,23 @@
   UI.qsa(".nav-item").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
 
   // ----------------------------------------------------------------
-  // VM display (noVNC iframe)
+  // VM display (direct noVNC link, terpisah dari dashboard)
   // ----------------------------------------------------------------
-  function bootConsole() {
-    const screen = UI.qs("#vm-screen");
-    const placeholder = UI.qs("#vm-placeholder");
-    if (!screen) return;
-
-    const iframe = document.createElement("iframe");
-    iframe.id = "vm-frame";
-    iframe.allow = "clipboard-read; clipboard-write";
-    // noVNC served from same origin; it will connect to /ws/vnc (aiohttp -> qemu VNC).
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const query = [
-      "autoconnect=true",
-      "resize=scale",
-      "reconnect=true",
-      "reconnect_delay=3000",
-      `host=${location.hostname}`,
-      `port=${location.port || (location.protocol === "https:" ? "443" : "80")}`,
-      "path=ws/vnc",
-      "shared=true",
-    ].join("&");
-    iframe.src = `/vendor/novnc/vnc.html?${query}`;
-    iframe.onload = () => {
-      if (placeholder) placeholder.remove();
-    };
-    placeholder.innerHTML = "Starting console&hellip;";
-    screen.appendChild(iframe);
+  function setupVncDirect() {
+    const btn = UI.qs("#vnc-direct-btn");
+    if (!btn) return;
+    const hint = UI.qs("#vnc-direct-hint");
+    btn.addEventListener("click", () => {
+      const vncUrl = window.__vmConfig && window.__vmConfig.vnc_url;
+      if (!vncUrl) {
+        UI.toast("noVNC tunnel tidak tersedia", "bad");
+        return;
+      }
+      window.open(`${vncUrl}/vnc.html?autoconnect=true&resize=scale`, "_blank");
+    });
+    if (window.__vmConfig && window.__vmConfig.vnc_url && hint) {
+      hint.textContent = `buka layar VM via ${window.__vmConfig.vnc_url}`;
+    }
   }
 
   // ----------------------------------------------------------------
@@ -276,7 +265,7 @@
   // ----------------------------------------------------------------
   async function init() {
     Serial.initConsoles();
-    bootConsole();
+    setupVncDirect();
     WS.connect();
     Metrics.setStartedAt(Date.now());
     // Initial fetches
@@ -297,6 +286,10 @@
       const mem = cfg.VM_MEMORY || "";
       const cpu = cfg.VM_CPUS || "";
       UI.setText("top-cfg", `${mem} RAM · ${cpu} vCPU`);
+      const hint = UI.qs("#vnc-direct-hint");
+      if (hint) hint.textContent = cfg.vnc_url
+        ? `buka layar VM via ${cfg.vnc_url}`
+        : "tunnel noVNC terpisah dari dashboard kontrol";
     } catch (_) {}
   }
 

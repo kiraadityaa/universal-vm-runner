@@ -17,7 +17,7 @@ Spin up a Linux distro in the cloud, interact with an installer, test a live ISO
 
 **Universal VM Runner** runs QEMU on a **free GitHub-hosted macOS Intel runner** (4 vCPU / 14 GB RAM on public repos) and exposes a **complete web management dashboard**:
 
-- 🖥️ **VM display** — embedded noVNC, resize-on-demand
+- 🖥️ **VM display** — direct noVNC, layar penuh via tunnel terpisah
 - ⌨️ **QMP control toolbar** — reset, power off, pause/resume, `Ctrl+Alt+Del`, F2, screenshot, snapshot
 - 🔌 **Interactive serial console** — xterm.js over WebSocket (works even when the GUI can't initialize)
 - 📊 **Live instruments** — power state, uptime, CPU load, RAM, disk I/O, vCPU count
@@ -39,24 +39,25 @@ macOS runner (macos-15-intel: 4 vCPU / 14 GB RAM)
         ├─ aiohttp dashboard (:8080) — API + WebSocket + static UI
         │     ├─ /api/vm/*         REST (status, power, keys, snapshot)
         │     ├─ /ws/qmp           QMP events + live metrics
-        │     ├─ /ws/serial        serial console bridge (xterm.js)
-        │     └─ /ws/vnc           VNC bridge (embedded noVNC)
-        └─ Cloudflare Quick Tunnel → https://xxx.trycloudflare.com
+        │     └─ /ws/serial        serial console bridge (xterm.js)
+        ├─ novnc_proxy (:6080) — raw noVNC / websockify → QEMU VNC :5900
+        ├─ Cloudflare Quick Tunnel #1 → :8080  (dashboard control)
+        └─ Cloudflare Quick Tunnel #2 → :6080  (direct noVNC, full screen)
 ```
 
-One URL, one origin — dashboard, VM display, serial console, and API all live behind the same tunnel.
+Two URLs, two jobs — **dashboard control** and **direct noVNC** each get their own public HTTPS link.
 
 ### Technology stack
 
 | Layer | What we use | Why |
 |---|---|---|
-| **Web server** | [aiohttp](https://docs.aiohttp.org/) — one Python process on `:8080` | Serves the static UI **and** the REST API **and** every WebSocket endpoint, so one tunnel URL is enough |
+| **Web server** | [aiohttp](https://docs.aiohttp.org/) — one Python process on `:8080` | Serves the static UI **and** the REST API **and** every WebSocket endpoint for dashboard control |
 | **VM control** | Self-contained **asyncio QMP client** (stdlib only) | Speaks the QEMU Machine Protocol over `/tmp/qmp.sock`: `greeting → qmp_capabilities` handshake, id-matched replies, auto-reconnect when the runner loop restarts QEMU, and broadcast of async events (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). No `qemu.qmp` dependency, so the runner needs just `aiohttp` + `psutil` |
 | **Serial console** | [xterm.js](https://xtermjs.org/) over `/ws/serial` | Interactive terminal that works even when the guest GUI can't initialize |
-| **VM display** | noVNC bridged through `/ws/vnc` | The tunnel only exposes `:8080`, so a WebSocket adapter relays VNC frames to the embedded noVNC client |
+| **VM display** | **Direct noVNC** via `novnc_proxy` on `:6080` | A separate Cloudflare Quick Tunnel exposes the raw noVNC client in full screen, independent of the dashboard |
 | **Instrument panel** | `psutil` + QMP `query-*` commands | Live host CPU/RAM and guest power/disk stats pushed every second |
 | **Installer monitoring** | Regex state machine on serial output | Classifies `booting → installing → ready / failed` without any guesswork |
-| **Public access** | Cloudflare Quick Tunnel → `:8080` | Public HTTPS URL, zero account, zero config |
+| **Public access** | **Two** Cloudflare Quick Tunnels → `:8080` + `:6080` | Public HTTPS URLs, zero account, zero config — one for dashboard control, one for direct noVNC |
 
 ### Self-healing boot (no "no bootable device" trap)
 
@@ -85,7 +86,7 @@ The dashboard's **installer monitor** watches the serial console and reports pha
 | `disk_size` | no | `20G` | Virtual disk size (sparse qcow2) |
 | `keep_alive_minutes` | no | `360` | Session length (max 360) |
 
-4. Run, wait ~1–2 minutes, then open the **`https://…trycloudflare.com`** URL printed in the `Run Universal VM` step log — that's the dashboard.
+4. Run, wait ~1–2 minutes, then open the **two `https://…trycloudflare.com` URLs** printed in the `Run Universal VM` step log — the dashboard-control link (`/vnc.html?autoconnect` for the noVNC link). The dashboard also shows the direct noVNC link on its VM Display panel.
 
 > Note: GitHub-hosted macOS runners are **free & unlimited on public repos**. The macOS label for **private** repos costs 10× Actions credits and is limited on the free plan.
 
@@ -93,7 +94,7 @@ The dashboard's **installer monitor** watches the serial console and reports pha
 
 | Section | What you can do |
 |---|---|
-| **VM Display** | Embedded noVNC console with a QMP toolbar: Reset, Resume, Pause, Power off, send `Ctrl+Alt+Del`, F2, Esc, screenshot, create snapshot |
+| **VM Display** | Button **Open noVNC — layar penuh** that jumps to the direct noVNC tunnel (full-screen client in a new tab); QMP toolbar: Reset, Resume, Pause, Power off, send `Ctrl+Alt+Del`, F2, Esc, screenshot, create snapshot |
 | **Serial Terminal** | Interactive xterm.js console (plus a plain log view) — the most reliable way to watch an installer |
 | **Instrument panel** | Live power state, uptime, CPU % (with sparkline), RAM, disk written, installer phase, vCPU count |
 | **Snapshots** | List VM checkpoints (tag, size, date) |
@@ -115,7 +116,7 @@ POST /api/vm/screendump          → capture a PNG
 GET  /ws/qmp                     → QMP events + 1s metrics push
 GET  /ws/serial                  → serial console (binary)
 GET  /ws/log                     → setup script task log
-GET  /ws/vnc                     → VNC bridge for noVNC
+GET  /ws/vnc                     → VNC bridge (fallback — the UI uses the direct noVNC tunnel instead)
 ```
 
 ## Good ISO choices
