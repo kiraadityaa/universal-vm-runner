@@ -30,7 +30,8 @@
 #   - noVNC proxy di port 6080 — tunnel "novnc" (layar penuh, vnc.html?autoconnect=true).
 #   - QMP unix socket untuk kontrol VM (status, reset, snapshot, send-key, screendump).
 #   - Serial console via unix socket /tmp/serial.sock.
-#   - -no-reboot: QEMU exit saat guest reboot → loop restart perintah yang sama (self-healing).
+#   - Single boot (tanpa loop reboot): reboot guest ditangani firmware QEMU (-boot order=cd);
+#     crash HVF di awal (<90s) → satu kali fallback TCG.
 
 set -euo pipefail
 
@@ -417,14 +418,12 @@ step 7 "Waiting for QEMU VNC port 5900..."
 # VNC port will be opened by QEMU (started in step 8)
 
 # ============================================================
-# STEP 8: RUN QEMU VM (reboot loop)
+# STEP 8: RUN QEMU VM (single boot, tanpa loop reboot)
 # ============================================================
 step 8 "Starting QEMU VM..."
 
 QEMU_COMMON=(
   -machine "$QEMU_MACHINE"
-  -cpu "${QEMU_CPU[@]}"
-  "${QEMU_ACCEL[@]}"
   -smp "$VM_CPUS"
   -m "$VM_MEMORY"
   -drive "file=${DISK_FILE},if=virtio,format=qcow2"
@@ -432,7 +431,7 @@ QEMU_COMMON=(
   -display none
   -device virtio-net-pci,netdev=net0
   -netdev "user,id=net0,hostfwd=tcp::8022-:22"
-  -device virtio-gpu-pci
+  -vga std
   -device virtio-keyboard-pci
   -device virtio-mouse-pci
   -qmp "unix:${QMP_SOCK},server=on,wait=off"
@@ -443,19 +442,59 @@ QEMU_COMMON=(
 # Catatan: log serial ke file dikelola oleh SerialManager di dashboard server
 # (membaca socket QEMU dan menulis ke vm-serial.log + stream browser).
 
-RESTART_COUNT=0
 KEEP_ALIVE_SECONDS=$((KEEP_ALIVE_MINUTES * 60))
 START_TIME=$(date +%s)
-SHORT_EXITS=0
 
 info "SSH guest port-forward: host 127.0.0.1:8022 -> guest :22 (port 22 host dipakai SSHD runner)"
-info "Boot order: hard disk dulu, fallback ke ISO selagi disk belum bootable (self-healing)."
+info "Boot order: hard disk (c) dulu, fallback ISO (d) selagi disk belum bootable."
+info "Guest reboot ditangani firmware QEMU — setelah installer reboot, BIOS otomatis boot hard disk."
 
-# Unified self-healing boot:
-#   - Setiap restart menjalankan perintah QEMU yang SAMA: -cdrom + -boot order=cd.
-#   - SeaBIOS/EFI mencoba hard disk (c) dulu; kalau belum bootable, fallback ke ISO (d).
-#   - Tidak ada asumsi "reboot = installer selesai"; BIOS yang memutuskan mau boot apa.
-#   - -no-reboot: guest reboot/poweroff -> QEMU exit -> loop restart perintah yang sama.
+# Single boot (tanpa auto-reboot, tanpa deteksi reboot):
+#   - QEMU dijalankan TANPA -no-reboot: reboot yang dipicu guest (mis. "Installation
+#     complete, reboot" dari Debian) diproses firmware di dalam proses yang sama.
+#   - -boot order=cd: SeaBIOS/EFI mencoba hard disk dulu; kalau belum bootable,
+#     fallback ke ISO. Tidak ada mekanisme "reboot = installer selesai".
+#   - Fallback SATU KALI: jika HVF crash di awal (<90s, mis. bug do_hv_vm_protect pada
+#     Homebrew QEMU 11.x), jalankan ulang sekali dengan TCG. Bukan loop, bukan deteksi.
+run_qemu() {
+  local accel="$1"
+  local cpu="$2"
+  echo -e "  ${C_CYAN}[QEMU] accel=${accel} cpu=${cpu} -cdrom '${ISO_FILE}' -boot order=cd${C_NC}"
+  "$QEMU_BIN" "${QEMU_COMMON[@]}" -accel "$accel" -cpu "$cpu" \
+    -cdrom "$ISO_FILE" -boot order=cd
+}
+
+QEMU_EXIT=0
+QEMU_DURATION=0
+ACCEL_FIRST="$QEMU_MODE_LABEL"
+
+if [ "$HVF_OK" -eq 1 ] && [ "$GUEST_ARCH" = "$HOST_ARCH" ]; then
+  QEMU_START=$(date +%s)
+  set +e
+  run_qemu hvf "${QEMU_CPU[0]:-host}"
+  QEMU_EXIT=$?
+  set -e
+  QEMU_DURATION=$(( $(date +%s) - QEMU_START ))
+  echo -e "  ${C_YELLOW}[INFO] QEMU (HVF) exited (rc=${QEMU_EXIT}) after ${QEMU_DURATION}s.${C_NC}"
+  if [ "$QEMU_EXIT" -ne 0 ] && [ "$QEMU_DURATION" -lt 90 ]; then
+    warn "HVF crash di awal (${QEMU_DURATION}s, rc=${QEMU_EXIT}) — mencoba SATU KALI dengan TCG."
+    set +e
+    run_qemu tcg "$GUEST_CPU_TEMPLATE"
+    QEMU_EXIT=$?
+    set -e
+    ACCEL_FIRST="TCG (fallback 1x)"
+    echo -e "  ${C_YELLOW}[INFO] QEMU (TCG) exited (rc=${QEMU_EXIT}).${C_NC}"
+  fi
+else
+  set +e
+  run_qemu tcg "$GUEST_CPU_TEMPLATE"
+  QEMU_EXIT=$?
+  set -e
+  echo -e "  ${C_YELLOW}[INFO] QEMU (TCG) exited (rc=${QEMU_EXIT}).${C_NC}"
+fi
+
+# Tunggu sampai keep-alive habis supaya dashboard + kedua tunnel tetap hidup
+# walau VM sudah berhenti (tidak ada relaunch QEMU).
 while true; do
   ELAPSED=$(( $(date +%s) - START_TIME ))
   REMAIN=$(( KEEP_ALIVE_SECONDS - ELAPSED ))
@@ -463,35 +502,8 @@ while true; do
     info "Keep-alive time exceeded (${KEEP_ALIVE_MINUTES} min). Session ending."
     break
   fi
-  info "Session remaining: ~$((REMAIN / 60)) min"
-
-  QEMU_START=$(date +%s)
-  echo -e "  ${C_CYAN}[BOOT #${RESTART_COUNT}] disk -> fallback ISO${C_NC}"
-  set +e
-  "$QEMU_BIN" "${QEMU_COMMON[@]}" -no-reboot -cdrom "$ISO_FILE" -boot order=cd
-  QEMU_EXIT=$?
-  set -e
-  QEMU_END=$(date +%s)
-  QEMU_DURATION=$((QEMU_END - QEMU_START))
-  echo -e "  ${C_YELLOW}[INFO] QEMU exited (rc=${QEMU_EXIT}) after ${QEMU_DURATION}s.${C_NC}"
-
-  # Short exit = kemungkinan crash, tapi jangan berhenti: disk/ISO masih jadi fallback.
-  # Session tetap hidup sampai keepalive habis.
-  if [ "$QEMU_DURATION" -lt 30 ]; then
-    SHORT_EXITS=$((SHORT_EXITS + 1))
-    warn "QEMU berhenti cepat (${QEMU_DURATION}s, #${SHORT_EXITS} berturut-turut) — kemungkinan crash."
-    if [ "$SHORT_EXITS" -ge 3 ]; then
-      warn "Banyak short-exit. Cek isi VM via VNC: jika 'no bootable device' muncul, boot akan otomatis"
-      warn "kembali ke ISO karena -boot order=cd. Kalau disk rusak permanen, re-run workflow saja."
-    fi
-    sleep 5
-  else
-    SHORT_EXITS=0
-  fi
-
-  RESTART_COUNT=$((RESTART_COUNT + 1))
-  info "Reboot #${RESTART_COUNT} — restarting QEMU (back online in a few seconds)..."
-  sleep 2
+  info "VM exited (rc=${QEMU_EXIT}, accel=${ACCEL_FIRST}); session remaining: ~$((REMAIN / 60)) min"
+  sleep 60
 done
 
 echo ""

@@ -146,7 +146,10 @@ class InstallerMonitor:
             self._set_state(STATE_FAILED, "No bootable device detected")
             return
 
-        if REBOOT_TO_HDD.search(text):
+        # Only report "installer finished" once we were actually installing.
+        # A bare "Booting from Hard Disk" or a Debian menu item while still
+        # booting/idle must NOT be mistaken for a finished install.
+        if REBOOT_TO_HDD.search(text) and self.state == STATE_INSTALLING:
             self._set_state(STATE_READY, "System booted from disk — installer finished")
             return
 

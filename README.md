@@ -52,25 +52,27 @@ Two URLs, two jobs — **dashboard control** and **direct noVNC** each get their
 | Layer | What we use | Why |
 |---|---|---|
 | **Web server** | [aiohttp](https://docs.aiohttp.org/) — one Python process on `:8080` | Serves the static UI **and** the REST API **and** every WebSocket endpoint for dashboard control |
-| **VM control** | Self-contained **asyncio QMP client** (stdlib only) | Speaks the QEMU Machine Protocol over `/tmp/qmp.sock`: `greeting → qmp_capabilities` handshake, id-matched replies, auto-reconnect when the runner loop restarts QEMU, and broadcast of async events (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). No `qemu.qmp` dependency, so the runner needs just `aiohttp` + `psutil` |
+| **VM control** | Self-contained **asyncio QMP client** (stdlib only) | Speaks the QEMU Machine Protocol over `/tmp/qmp.sock`: `greeting → qmp_capabilities` handshake, id-matched replies, auto-reconnect whenever QEMU (re)starts, and broadcast of async events (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). No `qemu.qmp` dependency, so the runner needs just `aiohttp` + `psutil` |
 | **Serial console** | [xterm.js](https://xtermjs.org/) over `/ws/serial` | Interactive terminal that works even when the guest GUI can't initialize |
 | **VM display** | **Direct noVNC** via `novnc_proxy` on `:6080` | A separate Cloudflare Quick Tunnel exposes the raw noVNC client in full screen, independent of the dashboard |
 | **Instrument panel** | `psutil` + QMP `query-*` commands | Live host CPU/RAM and guest power/disk stats pushed every second |
 | **Installer monitoring** | Regex state machine on serial output | Classifies `booting → installing → ready / failed` without any guesswork |
 | **Public access** | **Two** Cloudflare Quick Tunnels → `:8080` + `:6080` | Public HTTPS URLs, zero account, zero config — one for dashboard control, one for direct noVNC |
 
-### Self-healing boot (no "no bootable device" trap)
+### Single boot, no auto-reboot loop
 
-Every restart runs the **same** QEMU command with `-boot order=cd` — the firmware tries the **hard disk first**, and falls back to the **ISO** while the disk isn't bootable yet:
+QEMU runs **once** (no launcher loop, no "reboot detection"). The command uses `-boot order=cd` — the firmware tries the **hard disk first**, and falls back to the **ISO** while the disk isn't bootable yet:
 
 | Situation | Result |
 |---|---|
-| Install not finished, a reboot happens | Disk not bootable → auto re-enters **ISO installer** |
-| Install finished + reboot | Disk bootable → auto boots the **installed OS** |
+| Install not finished, a reboot happens | Disk not bootable → firmware re-enters **ISO installer** |
+| Install finished + reboot | Disk bootable → firmware boots the **installed OS** |
 | Reboot inside the installed OS | Disk bootable → stays on the **installed OS** |
-| Disk permanently broken | Falls back to ISO; re-run the workflow for a fresh disk |
+| Disk permanently broken | Falls back to the ISO; re-run the workflow for a fresh disk |
 
-The dashboard's **installer monitor** watches the serial console and reports phase, progress, and failures — so you're never guessing why the screen went dark.
+Because the VM runs **without `-no-reboot`**, a guest-initiated reboot (e.g. Debian's "Installation complete, reboot") is handled **by QEMU's firmware in the same process** — no external restart, no installer-monitor guesswork. The only fallback is a single one-time retry with **TCG** if HVF crashes within the first 90 s (known bug in Homebrew QEMU 11.x, see caveats). After the VM exits, the dashboard and both tunnels stay reachable until the keep-alive window ends.
+
+The dashboard's **installer monitor** watches the serial console and reports phase, progress, and failures — but `ready` is only reported after the VM was actually `installing`, so a bootloader/menu screen is never mistaken for a finished install.
 
 ## Quick start
 
@@ -138,6 +140,7 @@ The script detects acceleration at runtime:
 
 - **14 GB runner disk** — a >4 GB ISO plus a big qcow2 may not fit. Prefer slim/netinstall ISOs.
 - **HVF availability varies** across the runner fleet — probed every run, auto-falls back to TCG.
+- **Homebrew QEMU 11.x may crash at boot under HVF** (`do_hv_vm_protect: assertion failed: !(size & ~page_mask)` → `Abort trap` / exit 134) — an upstream QEMU regression from Jan-2026. The runner mitigates this with **`-vga std`** (avoids the virtio-gpu dirty-tracking path that triggers it) and a **single TCG retry** if HVF aborts within the first 90 s.
 - **Brief VNC drop** during a VM reboot (a few seconds; noVNC auto-reconnects).
 - **ISO stays attached** in the installed OS — harmless (disk boots first); a Debian "remove installation media" prompt is informational only.
 - **Ephemeral disk** — the qcow2 lives on the runner and is lost when the workflow ends. No persistence yet.
@@ -159,7 +162,7 @@ ssh user@127.0.0.1 -p 8022   # from the run's shell
 | File | Purpose |
 |---|---|
 | `.github/workflows/vm-runner.yml` | GitHub Actions workflow: install QEMU + cloudflared, run the VM |
-| `scripts/qemu/setup-vm.sh` | ISO download, arch/HVF detection, qcow2, dashboard + tunnel, QEMU reboot loop |
+| `scripts/qemu/setup-vm.sh` | ISO download, arch/HVF detection, qcow2, dashboard + tunnels, single QEMU boot (firmware-handled reboot, HVF→TCG fallback) |
 | `scripts/qemu/server/app.py` | aiohttp server: static UI + REST API + WebSockets |
 | `scripts/qemu/server/qmp_client.py` | self-contained asyncio QMP client (no `qemu.qmp` dep), auto-reconnect, event broadcast |
 | `scripts/qemu/server/installer_monitor.py` | install state machine from serial patterns |

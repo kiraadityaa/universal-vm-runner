@@ -52,25 +52,27 @@ Dua URL, dua peran — **kontrol dashboard** dan **direct noVNC** masing-masing 
 | Lapisan | Yang dipakai | Alasannya |
 |---|---|---|
 | **Server web** | [aiohttp](https://docs.aiohttp.org/) — satu proses Python di `:8080` | Menyajikan UI statis **dan** REST API **dan** semua endpoint WebSocket untuk kontrol dashboard |
-| **Kontrol VM** | **Klien QMP asyncio mandiri** (stdlib saja) | Berbicara ke QEMU Machine Protocol lewat `/tmp/qmp.sock`: handshake `greeting → qmp_capabilities`, reply dicocokkan berdasar id, auto-reconnect saat loop runner me-restart QEMU, dan broadcast event async (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). Tanpa dependency `qemu.qmp` — runner cukup butuh `aiohttp` + `psutil` |
+| **Kontrol VM** | **Klien QMP asyncio mandiri** (stdlib saja) | Berbicara ke QEMU Machine Protocol lewat `/tmp/qmp.sock`: handshake `greeting → qmp_capabilities`, reply dicocokkan berdasar id, auto-reconnect kapan pun QEMU (di)restart, dan broadcast event async (`RESET`, `SHUTDOWN`, `GUEST_PANICKED`). Tanpa dependency `qemu.qmp` — runner cukup butuh `aiohttp` + `psutil` |
 | **Konsol serial** | [xterm.js](https://xtermjs.org/) lewat `/ws/serial` | Terminal interaktif yang tetap berguna walau GUI guest gagal init |
 | **Tampilan VM** | **Direct noVNC** via `novnc_proxy` di `:6080` | Cloudflare Quick Tunnel terpisah meng-expose klien noVNC mentah layar penuh, independen dari dashboard |
 | **Panel instrumen** | `psutil` + perintah QMP `query-*` | Statistik CPU/RAM host serta daya/disk guest, dikirim tiap detik |
 | **Monitoring installer** | State machine regex pada output serial | Mengklasifikasikan `booting → installing → ready / failed` tanpa menebak-nebak |
 | **Akses publik** | **Dua** Cloudflare Quick Tunnel → `:8080` + `:6080` | URL HTTPS publik, tanpa akun, tanpa konfigurasi — satu untuk kontrol dashboard, satu untuk direct noVNC |
 
-### Boot self-healing (tanpa jebakan "no bootable device")
+### Single boot, tanpa loop reboot otomatis
 
-Setiap restart menjalankan perintah QEMU **yang sama** dengan `-boot order=cd` — firmware mencoba **hard disk lebih dulu**, dan **fallback ke ISO** selama disk belum bootable. Jadi:
+QEMU dijalankan **sekali** (tanpa loop launcher, tanpa "deteksi reboot"). Perintah memakai `-boot order=cd` — firmware mencoba **hard disk lebih dulu**, dan **fallback ke ISO** selama disk belum bootable. Jadi:
 
 | Situasi | Hasil |
 |---|---|
-| Install belum selesai, terjadi reboot | Disk belum bootable → otomatis masuk lagi ke **ISO installer** |
-| Install selesai + reboot | Disk bootable → otomatis boot ke **OS terpasang** |
+| Install belum selesai, terjadi reboot | Disk belum bootable → firmware masuk lagi ke **ISO installer** |
+| Install selesai + reboot | Disk bootable → firmware boot ke **OS terpasang** |
 | Reboot di dalam OS terpasang | Disk bootable → tetap di **OS terpasang** |
 | Disk rusak permanen | Fallback ke ISO; jalankan ulang workflow untuk disk baru |
 
-**Monitor installer** di dashboard mengawasi konsol serial dan melaporkan fase, progres, serta kegagalan — jadi Anda tidak pernah menebak-nebak kenapa layar gelap.
+Karena VM dijalankan **tanpa `-no-reboot`**, reboot yang dipicu guest (misal "Installation complete, reboot" Debian) ditangani **oleh firmware QEMU di proses yang sama** — tanpa restart dari luar, tanpa tebakan installer-monitor. Satu-satunya fallback adalah percobaan ulang **sekali** dengan **TCG** bila HVF crash di 90 detik pertama (bug QEMU Homebrew 11.x, lihat catatan). Setelah VM berhenti, dashboard dan kedua tunnel tetap bisa diakses sampai jendela keep-alive selesai.
+
+**Monitor installer** di dashboard mengawasi konsol serial dan melaporkan fase, progres, serta kegagalan — tapi status `ready` hanya dilaporkan setelah VM benar-benar `installing`, jadi layar bootloader/menu tidak pernah disangka install selesai.
 
 ## Quick start
 
@@ -138,6 +140,7 @@ Script mendeteksi akselerasi saat runtime:
 
 - **Disk runner 14 GB** — ISO >4 GB plus qcow2 besar mungkin tidak muat. Pilih ISO ramping/netinstall.
 - **Ketersediaan HVF bervariasi** antar runner — script memeriksanya tiap run dan otomatis fallback ke TCG.
+- **QEMU Homebrew 11.x bisa crash saat boot di HVF** (`do_hv_vm_protect: assertion failed: !(size & ~page_mask)` → `Abort trap` / exit 134) — regresi upstream QEMU sejak Jan-2026. Runner memitigasi dengan **`-vga std`** (menghindari jalur dirty-tracking virtio-gpu yang memicunya) dan **satu percobaan TCG ulang** bila HVF abort dalam 90 detik pertama.
 - **VNC sempat putus** saat reboot VM (beberapa detik; noVNC auto-konek ulang).
 - **ISO tetap terpasang** di OS terpasang — tidak berbahaya (disk boot lebih dulu); prompt Debian "remove installation media" hanya informasi.
 - **Disk ephemeral** — qcow2 ada di runner dan hilang saat workflow berakhir. Belum ada persistensi.
@@ -159,7 +162,7 @@ ssh user@127.0.0.1 -p 8022   # dari shell run
 | File | Fungsi |
 |---|---|
 | `.github/workflows/vm-runner.yml` | Workflow GitHub Actions: install QEMU + cloudflared, jalankan VM |
-| `scripts/qemu/setup-vm.sh` | Unduh ISO, deteksi arch/HVF, buat qcow2, nyalakan dashboard + tunnel, loop reboot QEMU |
+| `scripts/qemu/setup-vm.sh` | Unduh ISO, deteksi arch/HVF, buat qcow2, nyalakan dashboard + tunnel, boot QEMU sekali (reboot guest oleh firmware, fallback HVF→TCG) |
 | `scripts/qemu/server/app.py` | Server aiohttp: UI statis + REST API + WebSocket |
 | `scripts/qemu/server/qmp_client.py` | Klien QMP asyncio mandiri (tanpa dep `qemu.qmp`), auto-reconnect, broadcast event |
 | `scripts/qemu/server/installer_monitor.py` | State machine install dari pola serial |

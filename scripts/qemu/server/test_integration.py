@@ -60,17 +60,28 @@ def check():
             break
         except Exception:
             time.sleep(0.5)
-    # Give serial manager a moment to connect + process
-    time.sleep(8)
-    st = get("/api/vm/installer")
-    print("INSTALLER STATE:", st["state"], "| detail:", st["detail"])
-    assert st["state"] in ("ready", "installing", "booting"), f"unexpected: {st}"
-    if st["state"] == "ready":
-        print("PASS: installer monitor reached READY (reboot-to-HDD detected)")
-        return 0
-    else:
-        print("NOTE: final state is", st["state"], "— markers may have been coalesced")
-        return 0
+
+    # Poll the state machine as the fake serial stream plays out.
+    # Regression guard: an early "Booting from Hard Disk" (while still booting,
+    # not installing) must NOT flip the VM to "ready" — the Debian-menu bug.
+    seen_installing = False
+    final = None
+    for _ in range(50):
+        st = get("/api/vm/installer")
+        s = st["state"]
+        if s == "installing":
+            seen_installing = True
+        if s == "ready":
+            final = st
+            break
+        time.sleep(0.3)
+
+    print("INSTALLER STATE:", s, "| detail:", st["detail"], "| installing-before-ready:", seen_installing)
+    assert s in ("ready", "installing", "booting"), f"unexpected: {st}"
+    assert seen_installing, "state never reached 'installing' before 'ready' — READY gating broken"
+    if final is not None:
+        print("PASS: installer monitor reached READY via installing (reboot-to-HDD only after installing)")
+    return 0
 
 
 def main():
